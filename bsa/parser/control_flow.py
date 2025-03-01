@@ -31,8 +31,7 @@ class ControlFlowRefiner:
             # Skip if block already has a complete terminator (not just a type)
             if isinstance(block.get("terminator"), str) and (
                 "goto" in block["terminator"] or 
-                block["terminator"] == "return" or 
-                block["terminator"] == "revert"
+                block["terminator"] in ["return", "revert", "require", "assert"]
             ):
                 continue
                 
@@ -47,12 +46,55 @@ class ControlFlowRefiner:
                 block["terminator"] = "return"
                 continue
             
-            # Handle revert statements
-            if block.get("terminator") == "Revert":
-                # Update the terminator to the explicit "revert" value
-                block["terminator"] = "revert"
-                # Don't add a goto after a revert - it's a true terminator
+            # Handle revert/require/assert statements - all of these should be true terminators
+            if block.get("terminator") in ["Revert", "Require", "Assert"]:
+                # Update the terminator to the corresponding explicit value
+                term_type = block.get("terminator").lower()
+                block["terminator"] = term_type
+                # Don't add a goto after these - they're true terminators
                 continue
+            
+            # Handle any blocks with revert-like statements in their SSA representation
+            if "ssa_statements" in block:
+                handled = False
+                for stmt in block.get("ssa_statements", []):
+                    if stmt.startswith("revert ") or stmt == "revert":
+                        block["terminator"] = "revert"
+                        handled = True
+                        break
+                    elif stmt.startswith("require "):
+                        # Format: require inputValue_0 < 100
+                        # Preserve the entire condition in the terminator
+                        parts = stmt.split(" ", 1)
+                        if len(parts) > 1:
+                            binary_condition = parts[1]
+                            block["terminator"] = f"require {binary_condition}"
+                        else:
+                            block["terminator"] = "require"
+                        handled = True
+                        break
+                    elif stmt == "require":
+                        block["terminator"] = "require"
+                        handled = True
+                        break
+                    elif stmt.startswith("assert "):
+                        # Format: assert inputValue_0 != 50
+                        # Preserve the entire condition in the terminator
+                        parts = stmt.split(" ", 1)
+                        if len(parts) > 1:
+                            binary_condition = parts[1]
+                            block["terminator"] = f"assert {binary_condition}"
+                        else:
+                            block["terminator"] = "assert"
+                        handled = True
+                        break
+                    elif stmt == "assert":
+                        block["terminator"] = "assert"
+                        handled = True
+                        break
+                
+                if handled:
+                    continue
             
             # Special handling for emit statements
             if block.get("terminator") == "EmitStatement":
@@ -64,7 +106,57 @@ class ControlFlowRefiner:
                 else:
                     # Last block in function, should return
                     block["terminator"] = "return"
+                continue
                 
+            # Check if this is an empty block that we can optimize out
+            if len(block.get("statements", [])) == 0 and len(block.get("ssa_statements", [])) == 0:
+                # This is an empty block - see if we can optimize it by making the previous block
+                # go directly to where this block would go
+                if idx < len(basic_blocks) - 1:
+                    # There's a next block we can go to
+                    next_block = basic_blocks[idx + 1]
+                    
+                    # If the next block has a revert/require/assert, preserve that terminator type
+                    if next_block.get("terminator") in ["revert", "require", "assert"]:
+                        block["terminator"] = next_block.get("terminator")
+                    else:
+                        block["terminator"] = f"goto {next_block['id']}"
+                    
+                    # Look for blocks pointing to this empty block and update them
+                    for prev_idx, prev_block in enumerate(basic_blocks):
+                        term = prev_block.get("terminator", "")
+                        # Handle both regular goto and if-then-else goto patterns
+                        if isinstance(term, str) and f"goto {block['id']}" in term:
+                            # Special case for if statement handling
+                            if "if " in term and " then goto " in term and " else goto " in term:
+                                # Only redirect the relevant part of the if statement
+                                if f"then goto {block['id']}" in term and f"else goto {block['id']}" in term:
+                                    # Both branches go to this empty block, can completely replace with simple goto
+                                    if next_block.get("terminator") in ["revert", "require", "assert"]:
+                                        prev_block["terminator"] = next_block.get("terminator")
+                                    else:
+                                        prev_block["terminator"] = f"goto {next_block['id']}"
+                                elif f"then goto {block['id']}" in term:
+                                    # Only the 'then' branch, keep the else as is
+                                    parts = term.split(" then goto ")
+                                    condition = parts[0]
+                                    else_part = parts[1].split(" else goto ")[1]
+                                    prev_block["terminator"] = f"{condition} then goto {next_block['id']} else goto {else_part}"
+                                elif f"else goto {block['id']}" in term:
+                                    # Only the 'else' branch, keep the then as is
+                                    parts = term.split(" then goto ")
+                                    condition = parts[0]
+                                    then_part = parts[1].split(" else goto ")[0]
+                                    prev_block["terminator"] = f"{condition} then goto {then_part} else goto {next_block['id']}"
+                            else:
+                                # Simple goto replacement
+                                prev_block["terminator"] = term.replace(
+                                    f"goto {block['id']}", f"goto {next_block['id']}")
+                else:
+                    # Last block in function, should return
+                    block["terminator"] = "return"
+                continue
+            
             # For all other blocks, determine if they should goto next block or return
             if idx < len(basic_blocks) - 1:
                 # Not the last block, so add goto next block

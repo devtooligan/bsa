@@ -679,73 +679,10 @@ class SSAConverter:
         
         # Check if this is a binary operation (x > y, etc.) 
         if condition.get("nodeType") == "BinaryOperation":
-            left_expr = condition.get("leftExpression", {})
-            right_expr = condition.get("rightExpression", {})
-            operator = condition.get("operator", "")
-            
-            # Format left side
-            left_str = ""
-            if left_expr.get("nodeType") == "Identifier":
-                left_var = left_expr.get("name", "")
-                left_version = reads_dict.get(left_var, 0)
-                left_str = f"{left_var}_{left_version}"
-            elif left_expr.get("nodeType") == "IndexAccess":
-                # Handle array/mapping access
-                if var_name:
-                    left_str = f"{var_name}_{reads_dict.get(var_name, 0)}"
-                # Add direct approach for index access
-                else:
-                    base_expr = left_expr.get("baseExpression", {})
-                    index_expr = left_expr.get("indexExpression", {})
-                    if base_expr.get("nodeType") == "Identifier":
-                        base_name = base_expr.get("name", "")
-                        if index_expr.get("nodeType") == "Identifier":
-                            index_name = index_expr.get("name", "")
-                            structured_name = f"{base_name}[{index_name}]"
-                            if structured_name in reads_dict:
-                                left_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
-                            else:
-                                left_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_name}_{reads_dict.get(index_name, 0)}]"
-                        elif index_expr.get("nodeType") == "Literal":
-                            index_value = index_expr.get("value", "")
-                            structured_name = f"{base_name}[{index_value}]"
-                            if structured_name in reads_dict:
-                                left_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
-                            else:
-                                left_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_value}]"
-            
-            # Format right side
-            right_str = ""
-            if right_expr.get("nodeType") == "Literal":
-                right_str = str(right_expr.get("value", ""))
-            elif right_expr.get("nodeType") == "Identifier":
-                right_var = right_expr.get("name", "")
-                right_version = reads_dict.get(right_var, 0)
-                right_str = f"{right_var}_{right_version}"
-            # Add support for index access on right side too
-            elif right_expr.get("nodeType") == "IndexAccess":
-                base_expr = right_expr.get("baseExpression", {})
-                index_expr = right_expr.get("indexExpression", {})
-                if base_expr.get("nodeType") == "Identifier":
-                    base_name = base_expr.get("name", "")
-                    if index_expr.get("nodeType") == "Identifier":
-                        index_name = index_expr.get("name", "")
-                        structured_name = f"{base_name}[{index_name}]"
-                        if structured_name in reads_dict:
-                            right_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
-                        else:
-                            right_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_name}_{reads_dict.get(index_name, 0)}]"
-                    elif index_expr.get("nodeType") == "Literal":
-                        index_value = index_expr.get("value", "")
-                        structured_name = f"{base_name}[{index_value}]"
-                        if structured_name in reads_dict:
-                            right_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
-                        else:
-                            right_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_value}]"
-            
-            # Combine into complete condition
-            if left_str and right_str:
-                ssa_stmt += f"{left_str} {operator} {right_str}"
+            # Use our helper function for consistent binary operation formatting
+            binary_str = SSAConverter._format_binary_operation(condition, reads_dict)
+            if binary_str:
+                ssa_stmt += binary_str
             else:
                 # Fallback to simple variable reference
                 if var_name and var_name in reads_dict:
@@ -1047,6 +984,139 @@ class SSAConverter:
         return ssa_statements
     
     @staticmethod
+    def _format_binary_operation(binary_op, reads_dict):
+        """
+        Format a binary operation (e.g. x > y) with proper variable versioning.
+        
+        Args:
+            binary_op (dict): Binary operation node
+            reads_dict (dict): Dictionary mapping variables to their read versions
+            
+        Returns:
+            str: Formatted string representation of the binary operation
+        """
+        left_expr = binary_op.get("leftExpression", {})
+        right_expr = binary_op.get("rightExpression", {})
+        operator = binary_op.get("operator", "")
+        
+        # Format left side
+        left_str = ""
+        if left_expr.get("nodeType") == "Identifier":
+            var_name = left_expr.get("name", "")
+            var_version = reads_dict.get(var_name, 0)
+            left_str = f"{var_name}_{var_version}"
+        elif left_expr.get("nodeType") == "Literal":
+            left_str = str(left_expr.get("value", ""))
+        elif left_expr.get("nodeType") == "MemberAccess":
+            # Handle msg.sender, etc.
+            base = left_expr.get("expression", {})
+            member = left_expr.get("memberName", "")
+            if base.get("nodeType") == "Identifier":
+                base_name = base.get("name", "")
+                if base_name and member:
+                    member_access = f"{base_name}.{member}"
+                    if member_access in reads_dict:
+                        left_str = f"{member_access}_{reads_dict.get(member_access, 0)}"
+                    else:
+                        left_str = f"{base_name}_{reads_dict.get(base_name, 0)}.{member}"
+        elif left_expr.get("nodeType") == "IndexAccess":
+            # Handle array/mapping access like balances[msg.sender]
+            base_expr = left_expr.get("baseExpression", {})
+            index_expr = left_expr.get("indexExpression", {})
+            if base_expr.get("nodeType") == "Identifier":
+                base_name = base_expr.get("name", "")
+                if index_expr.get("nodeType") == "Identifier":
+                    index_name = index_expr.get("name", "")
+                    structured_name = f"{base_name}[{index_name}]"
+                    if structured_name in reads_dict:
+                        left_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                    else:
+                        left_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_name}_{reads_dict.get(index_name, 0)}]"
+                elif index_expr.get("nodeType") == "Literal":
+                    index_value = index_expr.get("value", "")
+                    structured_name = f"{base_name}[{index_value}]"
+                    if structured_name in reads_dict:
+                        left_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                    else:
+                        left_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_value}]"
+                elif index_expr.get("nodeType") == "MemberAccess":
+                    # Handle balances[msg.sender]
+                    member_base = index_expr.get("expression", {})
+                    member_name = index_expr.get("memberName", "")
+                    if member_base.get("nodeType") == "Identifier":
+                        member_base_name = member_base.get("name", "")
+                        structured_name = f"{base_name}[{member_base_name}.{member_name}]"
+                        if structured_name in reads_dict:
+                            left_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                        else:
+                            # If not tracked directly, use component parts
+                            left_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{member_base_name}_{reads_dict.get(member_base_name, 0)}.{member_name}]"
+        
+        # Format right side
+        right_str = ""
+        if right_expr.get("nodeType") == "Identifier":
+            var_name = right_expr.get("name", "")
+            var_version = reads_dict.get(var_name, 0)
+            right_str = f"{var_name}_{var_version}"
+        elif right_expr.get("nodeType") == "Literal":
+            right_str = str(right_expr.get("value", ""))
+        elif right_expr.get("nodeType") == "MemberAccess":
+            # Handle msg.sender, etc.
+            base = right_expr.get("expression", {})
+            member = right_expr.get("memberName", "")
+            if base.get("nodeType") == "Identifier":
+                base_name = base.get("name", "")
+                if base_name and member:
+                    member_access = f"{base_name}.{member}"
+                    if member_access in reads_dict:
+                        right_str = f"{member_access}_{reads_dict.get(member_access, 0)}"
+                    else:
+                        right_str = f"{base_name}_{reads_dict.get(base_name, 0)}.{member}"
+        elif right_expr.get("nodeType") == "IndexAccess":
+            # Handle array/mapping access like balances[msg.sender]
+            base_expr = right_expr.get("baseExpression", {})
+            index_expr = right_expr.get("indexExpression", {})
+            if base_expr.get("nodeType") == "Identifier":
+                base_name = base_expr.get("name", "")
+                if index_expr.get("nodeType") == "Identifier":
+                    index_name = index_expr.get("name", "")
+                    structured_name = f"{base_name}[{index_name}]"
+                    if structured_name in reads_dict:
+                        right_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                    else:
+                        right_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_name}_{reads_dict.get(index_name, 0)}]"
+                elif index_expr.get("nodeType") == "Literal":
+                    index_value = index_expr.get("value", "")
+                    structured_name = f"{base_name}[{index_value}]"
+                    if structured_name in reads_dict:
+                        right_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                    else:
+                        right_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_value}]"
+                elif index_expr.get("nodeType") == "MemberAccess":
+                    # Handle balances[msg.sender]
+                    member_base = index_expr.get("expression", {})
+                    member_name = index_expr.get("memberName", "")
+                    if member_base.get("nodeType") == "Identifier":
+                        member_base_name = member_base.get("name", "")
+                        structured_name = f"{base_name}[{member_base_name}.{member_name}]"
+                        if structured_name in reads_dict:
+                            right_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                        else:
+                            # If not tracked directly, use component parts
+                            right_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{member_base_name}_{reads_dict.get(member_base_name, 0)}.{member_name}]"
+        
+        if left_str and right_str:
+            return f"{left_str} {operator} {right_str}"
+        
+        # Fallback to just returning what we have
+        if left_str:
+            return left_str
+        if right_str:
+            return right_str
+        
+        return ""
+        
+    @staticmethod
     def _handle_revert_statement(node, reads_dict, block=None):
         """
         Process a revert statement and convert to SSA form.
@@ -1096,49 +1166,20 @@ class SSAConverter:
                 revert_args.append(f"{var_name}_{var_version}")
             elif arg.get("nodeType") == "BinaryOperation":
                 # Handle binary operations (common in require statements)
-                left_reads = set()
-                right_reads = set()
-                SSAConverter._extract_reads(arg.get("leftExpression", {}), left_reads)
-                SSAConverter._extract_reads(arg.get("rightExpression", {}), right_reads)
+                # Use our helper function for consistent formatting
+                binary_str = SSAConverter._format_binary_operation(arg, reads_dict)
+                if binary_str:
+                    revert_args.append(binary_str)
                 
-                # Format the left side
-                left_str = ""
-                if len(left_reads) == 1:
-                    var_name = next(iter(left_reads))
-                    var_version = reads_dict.get(var_name, 0)
-                    left_str = f"{var_name}_{var_version}"
-                elif arg.get("leftExpression", {}).get("nodeType") == "Identifier":
-                    var_name = arg.get("leftExpression", {}).get("name", "")
-                    var_version = reads_dict.get(var_name, 0)
-                    left_str = f"{var_name}_{var_version}"
-                
-                # Get the operator
-                operator = arg.get("operator", "")
-                
-                # Format the right side
-                right_str = ""
-                if len(right_reads) == 1:
-                    var_name = next(iter(right_reads))
-                    var_version = reads_dict.get(var_name, 0)
-                    right_str = f"{var_name}_{var_version}"
-                elif arg.get("rightExpression", {}).get("nodeType") == "Literal":
-                    right_str = str(arg.get("rightExpression", {}).get("value", ""))
-                elif arg.get("rightExpression", {}).get("nodeType") == "Identifier":
-                    var_name = arg.get("rightExpression", {}).get("name", "")
-                    var_version = reads_dict.get(var_name, 0)
-                    right_str = f"{var_name}_{var_version}"
-                
-                if left_str and right_str:
-                    revert_args.append(f"{left_str} {operator} {right_str}")
-                    # Add specific variables used in the condition to reads
-                    if arg.get("leftExpression", {}).get("nodeType") == "Identifier":
-                        left_var = arg.get("leftExpression", {}).get("name", "")
-                        if left_var: 
-                            arg_reads.add(left_var)
-                    if arg.get("rightExpression", {}).get("nodeType") == "Identifier":
-                        right_var = arg.get("rightExpression", {}).get("name", "")
-                        if right_var:
-                            arg_reads.add(right_var)
+                # Add specific variables used in the condition to reads
+                if arg.get("leftExpression", {}).get("nodeType") == "Identifier":
+                    left_var = arg.get("leftExpression", {}).get("name", "")
+                    if left_var: 
+                        arg_reads.add(left_var)
+                if arg.get("rightExpression", {}).get("nodeType") == "Identifier":
+                    right_var = arg.get("rightExpression", {}).get("name", "")
+                    if right_var:
+                        arg_reads.add(right_var)
         
         # Update block accesses if provided
         if block and "accesses" in block:
@@ -1148,40 +1189,27 @@ class SSAConverter:
             block["accesses"]["reads"] = list(reads)
             
             # Mark this block as a revert terminator
-            block["terminator"] = "revert"
+            if func_name in ["revert", "require", "assert"]:
+                block["terminator"] = func_name
         
         # Create the statement with arguments if any
         if revert_args:
-            # Include condition details for require/assert if available
-            formatted_args = []
-            for arg in expression.get("arguments", []):
-                if arg.get("nodeType") == "BinaryOperation" and func_name in ["require", "assert"]:
-                    # Format binary operations like "x < 10" properly
-                    op = arg.get("operator", "")
-                    left_expr = arg.get("leftExpression", {})
-                    right_expr = arg.get("rightExpression", {})
-                    
-                    left_str = ""
-                    if left_expr.get("nodeType") == "Identifier":
-                        var_name = left_expr.get("name", "")
-                        var_version = reads_dict.get(var_name, 0)
-                        left_str = f"{var_name}_{var_version}"
-                    
-                    right_str = ""
-                    if right_expr.get("nodeType") == "Literal":
-                        right_str = str(right_expr.get("value", ""))
-                    elif right_expr.get("nodeType") == "Identifier":
-                        var_name = right_expr.get("name", "")
-                        var_version = reads_dict.get(var_name, 0)
-                        right_str = f"{var_name}_{var_version}"
-                    
-                    if left_str and right_str:
-                        formatted_args.append(f"{left_str} {op} {right_str}")
-                    
-            # If we have formatted binary conditions, use them
-            if formatted_args:
-                return f"{func_name} {', '.join(formatted_args)}"
-            elif revert_args:
+            if len(revert_args) >= 1 and func_name in ["require", "assert"]:
+                # For require/assert, check if the first argument is a binary operation
+                first_arg = revert_args[0]
+                if any(op in first_arg for op in [">", "<", "==", "!=", ">=", "<="]):
+                    # This looks like a binary operation condition
+                    if len(revert_args) > 1:
+                        # If there's an error message after the condition
+                        return f"{func_name} {first_arg}, {', '.join(revert_args[1:])}"
+                    else:
+                        # Just the condition
+                        return f"{func_name} {first_arg}"
+                else:
+                    # Not a binary operation, use standard format
+                    return f"{func_name} {', '.join(revert_args)}"
+            else:
+                # Regular revert with arguments
                 return f"{func_name} {', '.join(revert_args)}"
         
         # Default fallback
@@ -1580,11 +1608,14 @@ class SSAConverter:
             if has_revert:
                 ssa_block["terminator"] = "revert"
                 
-            # Also check for any revert-like statement (revert/require/assert) in the last statement
-            if len(ssa_block["ssa_statements"]) > 0:
-                last_stmt = ssa_block["ssa_statements"][-1]
-                if last_stmt.startswith("revert ") or last_stmt.startswith("require ") or last_stmt.startswith("assert "):
-                    ssa_block["terminator"] = "revert"
+            # Always check for any revert-like statement (revert/require/assert) to override terminators
+            for i, stmt in enumerate(ssa_block["ssa_statements"]):
+                if stmt.startswith("revert ") or stmt.startswith("require ") or stmt.startswith("assert "):
+                    ssa_block["terminator"] = stmt.split()[0]  # Extract revert/require/assert as terminator
+                    # If this is not the last statement, we should remove statements after it
+                    if i < len(ssa_block["ssa_statements"]) - 1:
+                        ssa_block["ssa_statements"] = ssa_block["ssa_statements"][:i+1]
+                    break
                 
             # Clean up statements based on their classification
             new_statements = []
