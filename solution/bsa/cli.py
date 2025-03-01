@@ -98,30 +98,8 @@ def main(path):
                                     reads = block.get("accesses", {}).get("reads", [])
                                     writes = block.get("accesses", {}).get("writes", [])
                                     
-                                    # Format revert statements before printing
-                                    formatted_statements = []
-                                    for stmt in ssa_statements:
-                                        # Clean up revert statements for display
-                                        if "call[external](revert" in stmt:
-                                            args = stmt.split("call[external](revert")[1].strip(")")
-                                            if args.startswith(", "):
-                                                args = args[2:]  # Remove leading comma and space
-                                            formatted_statements.append(f"revert {args}")
-                                        elif "call[external](require" in stmt:
-                                            args = stmt.split("call[external](require")[1].strip(")")
-                                            if args.startswith(", "):
-                                                args = args[2:]  # Remove leading comma and space
-                                            formatted_statements.append(f"require {args}")
-                                        elif "call[external](assert" in stmt:
-                                            args = stmt.split("call[external](assert")[1].strip(")")
-                                            if args.startswith(", "):
-                                                args = args[2:]  # Remove leading comma and space
-                                            formatted_statements.append(f"assert {args}")
-                                        else:
-                                            formatted_statements.append(stmt)
-                                    
                                     print(f"    Block {block_id}:")
-                                    print(f"      SSA: {formatted_statements}")
+                                    print(f"      SSA: {ssa_statements}")
                                     print(f"      Terminator: {terminator}")
                                     print(f"      Accesses: reads={reads}, writes={writes}")
                         except (TypeError, AttributeError, IndexError) as e:
@@ -150,14 +128,9 @@ def main(path):
                         for call in all_calls:
                             call_line, call_col = call.get("location", [0, 0])
                             call_type = call.get("call_type", "unknown")
-                            call_name = call.get('name', 'unknown')
                             scope = "this contract" if call.get("in_contract", False) else "unknown"
                             
-                            # Skip revert, require, and assert - they're not real external calls
-                            if call_name in ["revert", "require", "assert"]:
-                                continue
-                                
-                            call_info = f"{call_name} ({scope}) at line {call_line}, col {call_col}"
+                            call_info = f"{call.get('name', 'unknown')} ({scope}) at line {call_line}, col {call_col}"
                             
                             # Categorize based on call type
                             if call.get("is_external", False) or call_type in ["external", "low_level_external", "delegatecall", "staticcall"]:

@@ -722,8 +722,9 @@ class SSAConverter:
             if func_expr.get("nodeType") == "Identifier":
                 func_name = func_expr.get("name", "")
                 if func_name in ["revert", "require", "assert"]:
-                    # Format revert statements directly without return variable
-                    # This is the key fix - we don't want the ret_var = part
+                    # Format revert statements directly
+                    ret_var = "ret"
+                    ret_version = writes_dict.get(ret_var, 1)
                     
                     # Get the arguments
                     args = []
@@ -738,11 +739,10 @@ class SSAConverter:
                             var_version = reads_dict.get(var_name, 0)
                             args.append(f"{var_name}_{var_version}")
                     
-                    # Return a direct revert/require/assert statement with no assignment
                     if args:
-                        return f"{func_name} {', '.join(args)}"
+                        return f"{ret_var}_{ret_version} = {func_name} {', '.join(args)}"
                     else:
-                        return func_name
+                        return f"{ret_var}_{ret_version} = {func_name}"
             
             # Check for member access calls (.call, .transfer, etc.)
             elif func_expr.get("nodeType") == "MemberAccess":
@@ -1456,36 +1456,7 @@ class SSAConverter:
                     elif stmt == ssa_block["ssa_statements"][-1]:
                         # require/assert only reverts if they're the last statement
                         ssa_block["terminator"] = "revert"
-                # Directly check for call[external](revert...) patterns
-                elif "call[external](revert" in stmt or "call[external](require" in stmt or "call[external](assert" in stmt:
-                    # Extract function name and args
-                    if "call[external](revert" in stmt:
-                        func_name = "revert"
-                        args_part = stmt.split("call[external](revert")[1].strip(")")
-                    elif "call[external](require" in stmt:
-                        func_name = "require"
-                        args_part = stmt.split("call[external](require")[1].strip(")")
-                    else:
-                        func_name = "assert"
-                        args_part = stmt.split("call[external](assert")[1].strip(")")
-                    
-                    # Clean up args
-                    if args_part and args_part.startswith(", "):
-                        args_part = args_part[2:]  # Remove leading comma and space
-                    
-                    # Create clean statement with function name and args
-                    if args_part:
-                        new_statements.append(f"{func_name} {args_part}")
-                    else:
-                        new_statements.append(func_name)
-                    
-                    # Set terminator
-                    if func_name == "revert":
-                        ssa_block["terminator"] = "revert"
-                    elif stmt == ssa_block["ssa_statements"][-1]:
-                        ssa_block["terminator"] = "revert"
-                
-                # Check for any other call statement
+                # Check for any call statement that might be a revert/require/assert
                 elif "call[" in stmt and "(" in stmt and ")" in stmt:
                     # Parse the call parts: type and function name
                     call_prefix = stmt.split("call[")[0] + "call["
@@ -1514,30 +1485,25 @@ class SSAConverter:
                         
                         # Handle revert type calls - regardless of call_type
                         if func_name in ["revert", "require", "assert"]:
-                            # Remove the original statement entirely - will replace with direct revert
-                            # Leaving this blank means we skip adding it to new_statements
-                            
-                            # Save the return part if needed
-                            # Then create proper revert/require/assert statements
                             if func_name == "revert":
                                 if args:
-                                    new_statements.append(f"revert {args}")
+                                    new_statements.append(f"{ret_part}revert {args}")
                                 else:
-                                    new_statements.append("revert")
+                                    new_statements.append(f"{ret_part}revert")
                                 ssa_block["terminator"] = "revert"
                             elif func_name == "require":
                                 if args:
-                                    new_statements.append(f"require {args}")
+                                    new_statements.append(f"{ret_part}require {args}")
                                 else:
-                                    new_statements.append("require")
+                                    new_statements.append(f"{ret_part}require")
                                 # Set terminator to revert if this is the last statement
                                 if stmt == ssa_block["ssa_statements"][-1]:
                                     ssa_block["terminator"] = "revert"
                             elif func_name == "assert":
                                 if args:
-                                    new_statements.append(f"assert {args}")
+                                    new_statements.append(f"{ret_part}assert {args}")
                                 else:
-                                    new_statements.append("assert")
+                                    new_statements.append(f"{ret_part}assert")
                                 # Set terminator to revert if this is the last statement
                                 if stmt == ssa_block["ssa_statements"][-1]:
                                     ssa_block["terminator"] = "revert"
