@@ -56,9 +56,9 @@ class TestEmitEvents:
         # 4. Fourth block with the return statement
         assert len(self.transfer["ssa"]) >= 4, f"Expected at least 4 blocks, but got {len(self.transfer['ssa'])}"
         
-        # Verify the emit block has the correct terminator
-        assert self.emit_block["terminator"] == "EmitStatement", \
-            f"Expected terminator 'EmitStatement', but got {self.emit_block.get('terminator')}"
+        # Verify the emit block has a goto terminator (used to be "EmitStatement" but now converted to goto in SSA conversion)
+        assert self.emit_block["terminator"].startswith("goto"), \
+            f"Expected terminator to be a goto statement, but got {self.emit_block.get('terminator')}"
     
     def test_emit_accesses(self):
         """Test that emit statements correctly track variable accesses."""

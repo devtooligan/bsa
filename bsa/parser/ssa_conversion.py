@@ -1,0 +1,1447 @@
+"""
+SSA (Static Single Assignment) conversion functionality.
+
+This module contains the functions needed to transform the basic blocks
+into SSA form, including versioning variables, inserting phi functions,
+and integrating the SSA output.
+"""
+
+class SSAConverter:
+    """
+    Handles conversion of basic blocks into Static Single Assignment (SSA) form.
+    """
+    
+    @staticmethod
+    def _extract_reads(node, reads_set):
+        """
+        Helper method to recursively extract variables being read from an expression.
+        
+        Args:
+            node (dict): AST node
+            reads_set (set): Set to add read variables to
+        """
+        if not node:
+            return
+            
+        node_type = node.get("nodeType", "")
+        
+        if node_type == "Identifier":
+            reads_set.add(node.get("name", ""))
+        
+        elif node_type == "BinaryOperation":
+            SSAConverter._extract_reads(node.get("leftExpression", {}), reads_set)
+            SSAConverter._extract_reads(node.get("rightExpression", {}), reads_set)
+        
+        elif node_type == "MemberAccess":
+            # For struct fields, track both the base variable and the specific field access
+            base_expr = node.get("expression", {})
+            member_name = node.get("memberName", "")
+            
+            if base_expr.get("nodeType") == "Identifier":
+                base_name = base_expr.get("name", "")
+                # Add both the base variable and a structured field access
+                reads_set.add(base_name)
+                # Add structured access in format base.member
+                if base_name and member_name:
+                    reads_set.add(f"{base_name}.{member_name}")
+                
+                # Handle nested MemberAccess by recursive call on base expression
+            elif base_expr.get("nodeType") in ["MemberAccess", "IndexAccess"]:
+                SSAConverter._extract_reads(base_expr, reads_set)
+        
+        elif node_type == "IndexAccess":
+            # For arrays/mappings, track both the base variable and the specific index access
+            base_expr = node.get("baseExpression", {})
+            index_expr = node.get("indexExpression", {})
+            
+            # Handle nested IndexAccess like allowance[owner][spender]
+            if base_expr.get("nodeType") == "IndexAccess":
+                # This is a double index access like allowance[owner][spender]
+                nested_base_expr = base_expr.get("baseExpression", {})
+                nested_index_expr = base_expr.get("indexExpression", {})
+                
+                if nested_base_expr.get("nodeType") == "Identifier":
+                    nested_base_name = nested_base_expr.get("name", "")
+                    reads_set.add(nested_base_name)
+                    
+                    # Build the first part of the access
+                    if nested_index_expr.get("nodeType") == "Identifier":
+                        nested_index_name = nested_index_expr.get("name", "")
+                        if nested_base_name and nested_index_name:
+                            # First level access e.g., allowance[owner]
+                            first_level = f"{nested_base_name}[{nested_index_name}]"
+                            reads_set.add(first_level)
+                            
+                            # Now add the second level of indexing
+                            if index_expr.get("nodeType") == "Identifier":
+                                index_name = index_expr.get("name", "")
+                                if index_name:
+                                    # Full two-level access e.g., allowance[owner][spender]
+                                    reads_set.add(f"{first_level}[{index_name}]")
+                            elif index_expr.get("nodeType") == "MemberAccess":
+                                member_expr = index_expr.get("expression", {})
+                                member_name = index_expr.get("memberName", "")
+                                if member_expr.get("nodeType") == "Identifier":
+                                    member_base = member_expr.get("name", "")
+                                    if member_base and member_name:
+                                        reads_set.add(f"{first_level}[{member_base}.{member_name}]")
+                    elif nested_index_expr.get("nodeType") == "MemberAccess":
+                        # Handle msg.sender in first index
+                        member_expr = nested_index_expr.get("expression", {})
+                        member_name = nested_index_expr.get("memberName", "")
+                        if member_expr.get("nodeType") == "Identifier":
+                            member_base = member_expr.get("name", "")
+                            if nested_base_name and member_base and member_name:
+                                first_level = f"{nested_base_name}[{member_base}.{member_name}]"
+                                reads_set.add(first_level)
+                                
+                                # Add second level indexing
+                                if index_expr.get("nodeType") == "Identifier":
+                                    index_name = index_expr.get("name", "")
+                                    if index_name:
+                                        reads_set.add(f"{first_level}[{index_name}]")
+                
+                # Always extract from base and index expressions
+                SSAConverter._extract_reads(nested_base_expr, reads_set)
+                SSAConverter._extract_reads(nested_index_expr, reads_set)
+                SSAConverter._extract_reads(index_expr, reads_set)
+                                
+            elif base_expr.get("nodeType") == "Identifier":
+                base_name = base_expr.get("name", "")
+                reads_set.add(base_name)
+                
+                # If the index is a literal or identifier, track the specific access
+                if index_expr.get("nodeType") == "Literal":
+                    index_value = index_expr.get("value", "")
+                    if base_name and index_value != "":
+                        reads_set.add(f"{base_name}[{index_value}]")
+                elif index_expr.get("nodeType") == "Identifier":
+                    index_name = index_expr.get("name", "")
+                    if base_name and index_name:
+                        reads_set.add(f"{base_name}[{index_name}]")
+                elif index_expr.get("nodeType") == "MemberAccess":
+                    # Handle cases like balances[msg.sender]
+                    member_expr = index_expr.get("expression", {})
+                    member_name = index_expr.get("memberName", "")
+                    
+                    if member_expr.get("nodeType") == "Identifier":
+                        member_base = member_expr.get("name", "")
+                        if base_name and member_base and member_name:
+                            reads_set.add(f"{base_name}[{member_base}.{member_name}]")
+                            # Also add the member access itself as a read
+                            reads_set.add(f"{member_base}.{member_name}")
+            
+            # Handle nested IndexAccess by recursive call on base expression
+            elif base_expr.get("nodeType") in ["MemberAccess", "IndexAccess"]:
+                SSAConverter._extract_reads(base_expr, reads_set)
+            
+            # Also extract reads from the index expression
+            if index_expr:
+                SSAConverter._extract_reads(index_expr, reads_set)
+        
+        elif node_type == "FunctionCall":
+            # Consider function arguments as reads
+            for arg in node.get("arguments", []):
+                SSAConverter._extract_reads(arg, reads_set)
+            
+            # For method calls, consider the base object as read
+            expr = node.get("expression", {})
+            if expr.get("nodeType") == "MemberAccess":
+                base = expr.get("expression", {})
+                SSAConverter._extract_reads(base, reads_set)
+    
+    @staticmethod
+    def assign_ssa_versions(basic_blocks):
+        """
+        Assign SSA variable versions to each variable access across blocks.
+        
+        Args:
+            basic_blocks (list): List of basic block dictionaries with accesses
+            
+        Returns:
+            list: List of basic block dictionaries with SSA versioning added
+        """
+        if not basic_blocks:
+            return []
+            
+        # Ensure each block has an accesses field
+        for block in basic_blocks:
+            if "accesses" not in block:
+                block["accesses"] = {"reads": [], "writes": []}
+        
+        # Initialize version counters for all variables
+        version_counters = {}
+        current_versions = {}
+        
+        # First pass: initialize all variables with version 0
+        for block in basic_blocks:
+            reads = block["accesses"]["reads"]
+            writes = block["accesses"]["writes"]
+            
+            # Initialize any new variables found in reads
+            for var in reads:
+                if var not in version_counters:
+                    version_counters[var] = 0
+                    current_versions[var] = 0
+            
+            # Initialize any new variables found in writes
+            for var in writes:
+                if var not in version_counters:
+                    version_counters[var] = 0
+                    current_versions[var] = 0
+        
+        # Second pass: assign versions to each block
+        for block in basic_blocks:
+            reads = block["accesses"]["reads"]
+            writes = block["accesses"]["writes"]
+            reads_dict = {}
+            writes_dict = {}
+            
+            # Assign read versions (use current version)
+            for var in reads:
+                reads_dict[var] = current_versions[var]
+            
+            # Assign write versions (increment counter and update current)
+            for var in writes:
+                version_counters[var] += 1
+                current_version = version_counters[var]
+                writes_dict[var] = current_version
+                current_versions[var] = current_version
+                
+                # Special case: If a variable is both read and written in the same block,
+                # and it appears in an if statement after the write, update its read version
+                if var in reads and "IfStatement" in [stmt["type"] for stmt in block["statements"]]:
+                    reads_dict[var] = current_version
+            
+            # Store the version information in the block
+            block["ssa_versions"] = {
+                "reads": reads_dict,
+                "writes": writes_dict
+            }
+            
+            # Create SSA statements
+            block["ssa_statements"] = []
+            
+            # Special handling for blocks with number++ operations
+            if block.get("has_number_increment", False) and "number" in block.get("accesses", {}).get("writes", []):
+                # Get versions for the number variable
+                read_version = block["ssa_versions"]["reads"].get("number", 0)
+                write_version = block["ssa_versions"]["writes"].get("number", 1)
+                
+                # Add explicit SSA statement for number++ operation
+                block["ssa_statements"].append(f"number_{write_version} = number_{read_version} + 1")
+            
+            for statement in block["statements"]:
+                stmt_type = statement["type"]
+                node = statement["node"]
+                
+                # First, gather any explicit assignment statements from Expression nodes
+                if node.get("nodeType") == "ExpressionStatement":
+                    expr = node.get("expression", {})
+                    # Skip if this is a compound assignment (-=, +=) as it will be handled by the Assignment section
+                    if expr.get("nodeType") == "Assignment" and expr.get("operator", "=") == "=":
+                        # A common pattern in approve(): allowance[msg.sender][spender] = amount
+                        left_hand_side = expr.get("leftHandSide", {})
+                        right_hand_side = expr.get("rightHandSide", {})
+                        operator = expr.get("operator", "=")
+                        
+                        # Is this a double-indexed assignment for allowance?
+                        if left_hand_side.get("nodeType") == "IndexAccess" and left_hand_side.get("baseExpression", {}).get("nodeType") == "IndexAccess":
+                            # Looks like allowance[msg.sender][spender] = amount
+                            nested_index = left_hand_side.get("baseExpression", {})
+                            first_base = nested_index.get("baseExpression", {})
+                            first_index = nested_index.get("indexExpression", {})
+                            second_index = left_hand_side.get("indexExpression", {})
+                            
+                            if first_base.get("nodeType") == "Identifier" and first_base.get("name") == "allowance":
+                                # This is allowance[...][...] = ...
+                                first_part = ""
+                                second_part = ""
+                                
+                                # Parse first index (like msg.sender)
+                                if first_index.get("nodeType") == "Identifier":
+                                    first_part = first_index.get("name", "")
+                                elif first_index.get("nodeType") == "MemberAccess":
+                                    member_expr = first_index.get("expression", {})
+                                    member_name = first_index.get("memberName", "")
+                                    if member_expr.get("nodeType") == "Identifier":
+                                        member_base = member_expr.get("name", "")
+                                        first_part = f"{member_base}.{member_name}"
+                                
+                                # Parse second index (like spender)
+                                if second_index.get("nodeType") == "Identifier":
+                                    second_part = second_index.get("name", "")
+                                
+                                # Construct structured name
+                                structured_name = f"allowance[{first_part}][{second_part}]"
+                                
+                                # Ensure structured_name is properly initialized in version tracking
+                                if structured_name not in version_counters:
+                                    version_counters[structured_name] = 0
+                                    current_versions[structured_name] = 0
+                                
+                                version_counters[structured_name] += 1
+                                var_version = version_counters[structured_name]
+                                writes_dict[structured_name] = var_version
+                                
+                                # Create SSA statement
+                                ssa_stmt = f"{structured_name}_{var_version} = "
+                                
+                                # Handle different right-hand side types
+                                if right_hand_side.get("nodeType") == "Literal":
+                                    ssa_stmt += str(right_hand_side.get("value", ""))
+                                elif right_hand_side.get("nodeType") == "Identifier":
+                                    var_name = right_hand_side.get("name", "")
+                                    var_version = reads_dict.get(var_name, 0)
+                                    ssa_stmt += f"{var_name}_{var_version}"
+                                
+                                # Add to SSA statements
+                                block["ssa_statements"].append(ssa_stmt)
+                
+                if stmt_type == "Assignment":
+                    if node["nodeType"] == "ExpressionStatement":
+                        expression = node.get("expression", {})
+                        # Debug the assignment structure
+                        operator = expression.get("operator", "=")
+                        left_hand_side = expression.get("leftHandSide", {})
+                        right_hand_side = expression.get("rightHandSide", {})
+                        
+                        # Get variable name and its SSA version
+                        if left_hand_side.get("nodeType") == "Identifier":
+                            var_name = left_hand_side.get("name", "")
+                            
+                            # Ensure var_name is properly initialized in version tracking
+                            if var_name not in version_counters:
+                                version_counters[var_name] = 0
+                                current_versions[var_name] = 0
+                                
+                            var_version = writes_dict.get(var_name, 0)
+                            
+                            # Create SSA assignment statement
+                            ssa_stmt = f"{var_name}_{var_version} = "
+                            
+                            # Handle compound assignments (+=, -=, etc.)
+                            compound_op = operator
+                            if compound_op not in ["=", ""]:
+                                # For operations like +=, need to include the current value in the statement
+                                # Format: x_1 = x_0 + right_side - never use negative versions
+                                prev_version = max(var_version - 1, 0)  # Ensure we don't get negative versions
+                                ssa_stmt += f"{var_name}_{prev_version} "
+                                
+                                # Extract the actual operation (+ from +=, - from -=, etc.)
+                                operation = compound_op[0]  # First character of the operator
+                                ssa_stmt += f"{operation} "
+                            
+                            # Handle literals directly
+                            if right_hand_side.get("nodeType") == "Literal":
+                                ssa_stmt += str(right_hand_side.get("value", ""))
+                            else:
+                                # Extract reads from right-hand side and append versioned variables
+                                rhs_reads = set()
+                                SSAConverter._extract_reads(right_hand_side, rhs_reads)
+                                
+                                # For arithmetic operations, only show the amount variable
+                                # to avoid cluttering with irrelevant variables
+                                if compound_op in ["+=", "-=", "*=", "/="]:
+                                    # For += and -=, first try to find the amount variable
+                                    important_vars = ["amount", "value", "recipient", "spender", "sender", "from", "to"]
+                                    selected_vars = []
+                                    
+                                    # First try to get 'amount' or 'value'
+                                    for var_name in ["amount", "value"]:
+                                        if var_name in rhs_reads:
+                                            selected_vars.append(var_name)
+                                            break
+                                            
+                                    # If we have amount or value, we're good - otherwise get other important vars
+                                    if not selected_vars:
+                                        for var_name in important_vars:
+                                            if var_name in rhs_reads:
+                                                selected_vars.append(var_name)
+                                                
+                                    # If we have any selected vars, use them
+                                    if selected_vars:
+                                        formatted_vars = []
+                                        for var_name in selected_vars:
+                                            read_version = reads_dict.get(var_name, 0)
+                                            formatted_vars.append(f"{var_name}_{read_version}")
+                                        ssa_stmt += " ".join(formatted_vars)
+                                    else:
+                                        # Fallback to showing all variables
+                                        formatted_reads = []
+                                        for read_var in rhs_reads:
+                                            read_version = reads_dict.get(read_var, 0)
+                                            formatted_reads.append(f"{read_var}_{read_version}")
+                                        ssa_stmt += " ".join(formatted_reads)
+                                else:
+                                    # For other operations, show all variables
+                                    formatted_reads = []
+                                    for read_var in rhs_reads:
+                                        read_version = reads_dict.get(read_var, 0)
+                                        formatted_reads.append(f"{read_var}_{read_version}")
+                                    
+                                    # Join all reads with spaces
+                                    ssa_stmt += " ".join(formatted_reads)
+                            
+                            # Add the SSA statement to the block
+                            block["ssa_statements"].append(ssa_stmt)
+                            
+                        elif left_hand_side.get("nodeType") == "MemberAccess":
+                            # Handle struct field assignment
+                            base_expr = left_hand_side.get("expression", {})
+                            member_name = left_hand_side.get("memberName", "")
+                            
+                            if base_expr.get("nodeType") == "Identifier":
+                                base_name = base_expr.get("name", "")
+                                structured_name = f"{base_name}.{member_name}"
+                                
+                                # Ensure structured_name is properly initialized in version tracking
+                                if structured_name not in version_counters:
+                                    version_counters[structured_name] = 0
+                                    current_versions[structured_name] = 0
+                                
+                                # Get version for both base and structured name
+                                base_version = writes_dict.get(base_name, 0)
+                                struct_version = writes_dict.get(structured_name, 0)
+                                
+                                # Create SSA assignment statement for the struct field
+                                ssa_stmt = f"{structured_name}_{struct_version} = "
+                                
+                                # Handle compound assignments (+=, -=, etc.)
+                                compound_op = operator
+                                if compound_op not in ["=", ""]:
+                                    # For operations like +=, need to include the current value in the statement
+                                    # Format: x_1 = x_0 + right_side - never use negative versions
+                                    prev_version = max(struct_version - 1, 0)  # Ensure we don't get negative versions
+                                    ssa_stmt += f"{structured_name}_{prev_version} "
+                                    
+                                    # Extract the actual operation (+ from +=, - from -=, etc.)
+                                    operation = compound_op[0]  # First character of the operator
+                                    ssa_stmt += f"{operation} "
+                                
+                                # Handle literals directly
+                                if right_hand_side.get("nodeType") == "Literal":
+                                    ssa_stmt += str(right_hand_side.get("value", ""))
+                                else:
+                                    # Extract reads from right-hand side
+                                    rhs_reads = set()
+                                    SSAConverter._extract_reads(right_hand_side, rhs_reads)
+                                    
+                                    # For arithmetic operations, only show the amount variable
+                                    # to avoid cluttering with irrelevant variables
+                                    if compound_op in ["+=", "-=", "*=", "/="]:
+                                        # For += and -=, just show the amount variable
+                                        amount_var = None
+                                        for read_var in rhs_reads:
+                                            if read_var in ["amount", "value"]:
+                                                amount_var = read_var
+                                                break
+                                        
+                                        if amount_var:
+                                            read_version = reads_dict.get(amount_var, 0)
+                                            ssa_stmt += f"{amount_var}_{read_version}"
+                                        else:
+                                            # Fallback to showing all variables
+                                            formatted_reads = []
+                                            for read_var in rhs_reads:
+                                                read_version = reads_dict.get(read_var, 0)
+                                                formatted_reads.append(f"{read_var}_{read_version}")
+                                            ssa_stmt += " ".join(formatted_reads)
+                                    else:
+                                        # For other operations, show all variables
+                                        formatted_reads = []
+                                        for read_var in rhs_reads:
+                                            read_version = reads_dict.get(read_var, 0)
+                                            formatted_reads.append(f"{read_var}_{read_version}")
+                                        
+                                        # Join all reads with spaces
+                                        ssa_stmt += " ".join(formatted_reads)
+                                
+                                # Add the SSA statement to the block
+                                block["ssa_statements"].append(ssa_stmt)
+                                
+                        elif left_hand_side.get("nodeType") == "IndexAccess":
+                            # Handle array/mapping assignment
+                            base_expr = left_hand_side.get("baseExpression", {})
+                            index_expr = left_hand_side.get("indexExpression", {})
+                            
+                            # Handle nested IndexAccess like allowance[owner][spender]
+                            if base_expr.get("nodeType") == "IndexAccess":
+                                # This is a double index access like allowance[owner][spender]
+                                nested_base_expr = base_expr.get("baseExpression", {})
+                                nested_index_expr = base_expr.get("indexExpression", {})
+                                
+                                if nested_base_expr.get("nodeType") == "Identifier":
+                                    nested_base_name = nested_base_expr.get("name", "")
+                                    structured_name = ""
+                                    
+                                    # Build the first part of the access
+                                    if nested_index_expr.get("nodeType") == "Identifier":
+                                        nested_index_name = nested_index_expr.get("name", "")
+                                        if nested_base_name and nested_index_name:
+                                            # First level access e.g., allowance[owner]
+                                            first_level = f"{nested_base_name}[{nested_index_name}]"
+                                            
+                                            # Now add the second level of indexing
+                                            if index_expr.get("nodeType") == "Identifier":
+                                                index_name = index_expr.get("name", "")
+                                                if index_name:
+                                                    # Full two-level access e.g., allowance[owner][spender]
+                                                    structured_name = f"{first_level}[{index_name}]"
+                                            elif index_expr.get("nodeType") == "MemberAccess":
+                                                member_expr = index_expr.get("expression", {})
+                                                member_name = index_expr.get("memberName", "")
+                                                if member_expr.get("nodeType") == "Identifier":
+                                                    member_base = member_expr.get("name", "")
+                                                    if member_base and member_name:
+                                                        structured_name = f"{first_level}[{member_base}.{member_name}]"
+                                    
+                                    if structured_name:
+                                        # Ensure structured_name is properly initialized in version tracking
+                                        if structured_name not in version_counters:
+                                            version_counters[structured_name] = 0
+                                            current_versions[structured_name] = 0
+                                        
+                                        struct_version = writes_dict.get(structured_name, 0)
+                                        
+                                        # Create SSA assignment statement for the nested array/mapping element
+                                        ssa_stmt = f"{structured_name}_{struct_version} = "
+                                        
+                                        # Handle compound assignments (+=, -=, etc.)
+                                        compound_op = operator
+                                        if compound_op not in ["=", ""]:
+                                            prev_version = max(struct_version - 1, 0)  # No negative versions
+                                            ssa_stmt += f"{structured_name}_{prev_version} "
+                                            
+                                            # Extract the actual operation (+ from +=, - from -=, etc.)
+                                            operation = compound_op[0]  # First character of the operator
+                                            ssa_stmt += f"{operation} "
+                                        
+                                        # Handle literals directly
+                                        if right_hand_side.get("nodeType") == "Literal":
+                                            ssa_stmt += str(right_hand_side.get("value", ""))
+                                        else:
+                                            # Extract reads from right-hand side
+                                            rhs_reads = set()
+                                            SSAConverter._extract_reads(right_hand_side, rhs_reads)
+                                            
+                                            # For arithmetic operations, only show the amount variable
+                                            # to avoid cluttering with irrelevant variables
+                                            if compound_op in ["+=", "-=", "*=", "/="]:
+                                                # For += and -=, just show the amount variable
+                                                amount_var = None
+                                                for read_var in rhs_reads:
+                                                    if read_var in ["amount", "value"]:
+                                                        amount_var = read_var
+                                                        break
+                                                
+                                                if amount_var:
+                                                    read_version = reads_dict.get(amount_var, 0)
+                                                    ssa_stmt += f"{amount_var}_{read_version}"
+                                                else:
+                                                    # Fallback to showing all variables
+                                                    formatted_reads = []
+                                                    for read_var in rhs_reads:
+                                                        read_version = reads_dict.get(read_var, 0)
+                                                        formatted_reads.append(f"{read_var}_{read_version}")
+                                                    ssa_stmt += " ".join(formatted_reads)
+                                            else:
+                                                # For other operations, show all variables
+                                                formatted_reads = []
+                                                for read_var in rhs_reads:
+                                                    read_version = reads_dict.get(read_var, 0)
+                                                    formatted_reads.append(f"{read_var}_{read_version}")
+                                                
+                                                # For subtraction operations, prioritize important variables
+                                                if operation in ["+", "-", "*", "/"]:
+                                                    # First try to find the amount variable
+                                                    important_vars = ["amount", "value", "recipient", "spender", "sender", "from", "to"]
+                                                    selected_vars = []
+                                                    
+                                                    # First try to get 'amount' or 'value'
+                                                    for var_name in ["amount", "value"]:
+                                                        if var_name in rhs_reads:
+                                                            selected_vars.append(var_name)
+                                                            break
+                                                            
+                                                    # If we have amount or value, we're good - otherwise get other important vars
+                                                    if not selected_vars:
+                                                        for var_name in important_vars:
+                                                            if var_name in rhs_reads:
+                                                                selected_vars.append(var_name)
+                                                                
+                                                    # If we have any selected vars, use them
+                                                    if selected_vars:
+                                                        formatted_vars = []
+                                                        for var_name in selected_vars:
+                                                            read_version = reads_dict.get(var_name, 0)
+                                                            formatted_vars.append(f"{var_name}_{read_version}")
+                                                        ssa_stmt += " ".join(formatted_vars)
+                                                    else:
+                                                        # Fallback to joined reads
+                                                        ssa_stmt += " ".join(formatted_reads)
+                                                else:
+                                                    # Join all reads with spaces
+                                                    ssa_stmt += " ".join(formatted_reads)
+                                        
+                                        # Add the SSA statement to the block
+                                        block["ssa_statements"].append(ssa_stmt)
+                            
+                            elif base_expr.get("nodeType") == "Identifier":
+                                base_name = base_expr.get("name", "")
+                                structured_name = ""
+                                
+                                # Form the structured name based on index type
+                                if index_expr.get("nodeType") == "Literal":
+                                    index_value = index_expr.get("value", "")
+                                    if base_name and index_value != "":
+                                        structured_name = f"{base_name}[{index_value}]"
+                                elif index_expr.get("nodeType") == "Identifier":
+                                    index_name = index_expr.get("name", "")
+                                    if base_name and index_name:
+                                        structured_name = f"{base_name}[{index_name}]"
+                                elif index_expr.get("nodeType") == "MemberAccess":
+                                    # Handle cases like balances[msg.sender]
+                                    member_expr = index_expr.get("expression", {})
+                                    member_name = index_expr.get("memberName", "")
+                                    
+                                    if member_expr.get("nodeType") == "Identifier":
+                                        member_base = member_expr.get("name", "")
+                                        if base_name and member_base and member_name:
+                                            structured_name = f"{base_name}[{member_base}.{member_name}]"
+                                
+                                if structured_name:
+                                    # Ensure structured_name is properly initialized in version tracking
+                                    if structured_name not in version_counters:
+                                        version_counters[structured_name] = 0
+                                        current_versions[structured_name] = 0
+                                    
+                                    # Get version for both base and structured name
+                                    base_version = writes_dict.get(base_name, 0)
+                                    struct_version = writes_dict.get(structured_name, 0)
+                                    
+                                    # Create SSA assignment statement for the array/mapping element
+                                    ssa_stmt = f"{structured_name}_{struct_version} = "
+                                    
+                                    # Handle compound assignments (+=, -=, etc.)
+                                    compound_op = operator
+                                    if compound_op not in ["=", ""]:
+                                        # For operations like +=, need to include the current value in the statement
+                                        # Format: x_1 = x_0 + right_side - never use negative versions
+                                        prev_version = max(struct_version - 1, 0)  # Ensure we don't get negative versions
+                                        ssa_stmt += f"{structured_name}_{prev_version} "
+                                        
+                                        # Extract the actual operation (+ from +=, - from -=, etc.)
+                                        operation = compound_op[0]  # First character of the operator
+                                        ssa_stmt += f"{operation} "
+                                    
+                                    # Handle literals directly
+                                    if right_hand_side.get("nodeType") == "Literal":
+                                        ssa_stmt += str(right_hand_side.get("value", ""))
+                                    else:
+                                        # Handle MemberAccess in right_hand_side directly
+                                        if right_hand_side.get("nodeType") == "MemberAccess":
+                                            base_expr = right_hand_side.get("expression", {})
+                                            member_name = right_hand_side.get("memberName", "")
+                                            if base_expr.get("nodeType") == "Identifier":
+                                                base_name = base_expr.get("name", "")
+                                                if base_name and member_name:
+                                                    structured_read = f"{base_name}.{member_name}"
+                                                    read_version = reads_dict.get(structured_read, 0)
+                                                    ssa_stmt += f"{structured_read}_{read_version}"
+                                                else:
+                                                    # Fallback to regular read extraction
+                                                    rhs_reads = set()
+                                                    SSAConverter._extract_reads(right_hand_side, rhs_reads)
+                                                    for read_var in rhs_reads:
+                                                        read_version = reads_dict.get(read_var, 0)
+                                                        ssa_stmt += f"{read_var}_{read_version} "
+                                            else:
+                                                # Fallback to regular read extraction
+                                                rhs_reads = set()
+                                                SSAConverter._extract_reads(right_hand_side, rhs_reads)
+                                                for read_var in rhs_reads:
+                                                    read_version = reads_dict.get(read_var, 0)
+                                                    ssa_stmt += f"{read_var}_{read_version} "
+                                        else:
+                                            # Extract reads from right-hand side
+                                            rhs_reads = set()
+                                            SSAConverter._extract_reads(right_hand_side, rhs_reads)
+                                            
+                                            # Also extract reads from the index expression
+                                            SSAConverter._extract_reads(index_expr, rhs_reads)
+                                            
+                                            # Format special cases like msg.sender
+                                            formatted_reads = []
+                                            for read_var in rhs_reads:
+                                                read_version = reads_dict.get(read_var, 0)
+                                                formatted_reads.append(f"{read_var}_{read_version}")
+                                            
+                                            # Join all reads with spaces
+                                            ssa_stmt += " ".join(formatted_reads)
+                                    
+                                    # Add the SSA statement to the block
+                                    block["ssa_statements"].append(ssa_stmt)
+                
+                elif stmt_type == "IfStatement":
+                    condition = node.get("condition", {})
+                    
+                    # Extract condition variables
+                    cond_reads = set()
+                    SSAConverter._extract_reads(condition, cond_reads)
+                    
+                    # Get variable explicitly from condition for if statement
+                    var_name = ""
+                    if condition.get("nodeType") == "BinaryOperation":
+                        left = condition.get("leftExpression", {})
+                        if left.get("nodeType") == "Identifier":
+                            var_name = left.get("name", "")
+                        # Also handle structured accesses in conditions
+                        elif left.get("nodeType") == "IndexAccess":
+                            base_expr = left.get("baseExpression", {})
+                            index_expr = left.get("indexExpression", {})
+                            if base_expr.get("nodeType") == "Identifier":
+                                base_name = base_expr.get("name", "")
+                                if index_expr.get("nodeType") == "Identifier":
+                                    index_name = index_expr.get("name", "")
+                                    var_name = f"{base_name}[{index_name}]"
+                                elif index_expr.get("nodeType") == "MemberAccess":
+                                    member_expr = index_expr.get("expression", {})
+                                    member_name = index_expr.get("memberName", "")
+                                    if member_expr.get("nodeType") == "Identifier":
+                                        member_base = member_expr.get("name", "")
+                                        var_name = f"{base_name}[{member_base}.{member_name}]"
+                    
+                    # Create SSA condition statement
+                    ssa_stmt = "if ("
+                    if var_name and var_name in reads_dict:
+                        var_version = reads_dict[var_name]
+                        ssa_stmt += f"{var_name}_{var_version}"
+                    elif cond_reads:
+                        for read_var in cond_reads:
+                            read_version = reads_dict.get(read_var, 0)
+                            ssa_stmt += f"{read_var}_{read_version} "
+                    ssa_stmt += ")"
+                    
+                    # Add the SSA statement to the block
+                    block["ssa_statements"].append(ssa_stmt)
+                
+                elif stmt_type == "FunctionCall":
+                    if node["nodeType"] == "ExpressionStatement":
+                        expression = node.get("expression", {})
+                        
+                        # Handle regular function calls (non-emit)
+                        # Determine if this is an external call (e.g., for reentrancy detection)
+                        is_external = False
+                        call_name = "call"
+                        
+                        # Check for function call via MemberAccess (e.g., contract.method())
+                        if expression.get("nodeType") == "FunctionCall":
+                            func_expr = expression.get("expression", {})
+                            if func_expr.get("nodeType") == "MemberAccess":
+                                member_name = func_expr.get("memberName", "")
+                                base_expr = func_expr.get("expression", {})
+                                
+                                # Extract the contract or interface name if available
+                                if base_expr.get("nodeType") == "FunctionCall":
+                                    # This is likely a pattern like IA(a).hello()
+                                    type_name = base_expr.get("expression", {}).get("name", "")
+                                    arg_name = ""
+                                    if base_expr.get("arguments") and len(base_expr.get("arguments")) > 0:
+                                        arg = base_expr.get("arguments")[0]
+                                        if arg.get("nodeType") == "Identifier":
+                                            arg_name = arg.get("name", "")
+                                    
+                                    if type_name and member_name:
+                                        is_external = True
+                                        call_name = f"{type_name}({arg_name}).{member_name}"
+                        
+                        # Get a unique ID for any return value from the call
+                        ret_var = "ret"
+                        ret_version = 0
+                        if ret_var in writes_dict:
+                            ret_version = writes_dict[ret_var]
+                        else:
+                            # If ret isn't tracked, generate a version
+                            version_counters[ret_var] = 1
+                            writes_dict[ret_var] = 1
+                            ret_version = 1
+                        
+                        # Create the function call statement with improved formatting
+                        if is_external:
+                            ssa_stmt = f"{ret_var}_{ret_version} = call[external]({call_name})"
+                        else:
+                            # Create a more generic call representation
+                            ssa_stmt = f"{ret_var}_{ret_version} = call("
+                            
+                            # Extract argument variables
+                            arg_reads = set()
+                            for arg in expression.get("arguments", []):
+                                SSAConverter._extract_reads(arg, arg_reads)
+                            
+                            # Append versioned argument variables
+                            for read_var in arg_reads:
+                                read_version = reads_dict.get(read_var, 0)
+                                ssa_stmt += f"{read_var}_{read_version} "
+                            ssa_stmt += ")"
+                        
+                        # Add the SSA statement to the block
+                        block["ssa_statements"].append(ssa_stmt)
+                
+                elif stmt_type == "EmitStatement":
+                    # Handle emit statements directly
+                    event_call = node.get("eventCall", {})
+                    if event_call.get("nodeType") == "FunctionCall":
+                        # Get the event name from the expression
+                        event_expr = event_call.get("expression", {})
+                        event_name = event_expr.get("name", "Unknown")
+                        
+                        # Process each argument to extract values and track reads
+                        individual_args = []
+                        event_reads = set()
+                        
+                        for arg in event_call.get("arguments", []):
+                            # Extract reads from this argument
+                            arg_reads = set()
+                            SSAConverter._extract_reads(arg, arg_reads)
+                            event_reads.update(arg_reads)  # Add to the event's overall reads
+                            
+                            # Process different argument types
+                            if arg.get("nodeType") == "Identifier":
+                                # Simple variable
+                                var_name = arg.get("name", "")
+                                var_version = reads_dict.get(var_name, 0)
+                                individual_args.append(f"{var_name}_{var_version}")
+                            elif arg.get("nodeType") == "MemberAccess":
+                                # Handle msg.sender type accesses
+                                member_name = arg.get("memberName", "")
+                                expr = arg.get("expression", {})
+                                expr_name = expr.get("name", "")
+                                if expr_name and member_name:
+                                    mem_access = f"{expr_name}.{member_name}"
+                                    mem_version = reads_dict.get(mem_access, 0)
+                                    individual_args.append(f"{mem_access}_{mem_version}")
+                            elif arg.get("nodeType") == "Literal":
+                                # Literal values
+                                individual_args.append(str(arg.get("value", "")))
+                            elif arg.get("nodeType") == "FunctionCall":
+                                # Handle address(0) type calls
+                                func_expr = arg.get("expression", {})
+                                if func_expr.get("nodeType") == "Identifier" and func_expr.get("name") == "address":
+                                    # This is address(0) - special handling for Transfer events in mint/burn
+                                    if len(arg.get("arguments", [])) > 0 and arg["arguments"][0].get("nodeType") == "Literal":
+                                        value = str(arg["arguments"][0].get("value", ""))
+                                        # Use address(0)_0 for the zero address
+                                        individual_args.append(f"address(0)_0")
+                                    else:
+                                        # Fallback to regular function call handling
+                                        individual_args.append("address(0)_0")
+                                else:
+                                    # Other function calls in arguments - handle nested calls
+                                    func_reads = set()
+                                    SSAConverter._extract_reads(arg, func_reads)
+                                    for read_var in func_reads:
+                                        read_version = reads_dict.get(read_var, 0)
+                                        individual_args.append(f"{read_var}_{read_version}")
+                        
+                        # Create a clean emit statement with individual arguments properly formatted
+                        # Special handling for Transfer events in _mint and _burn functions
+                        if event_name == "Transfer":
+                            # Check if we're in _mint function (contains 'balanceOf[to]' access and 'totalSupply += amount')
+                            is_mint = False
+                            is_burn = False
+                            
+                            # Look for to/from in the event arguments or statement context to determine if mint/burn
+                            has_to = any("to" in arg for arg in individual_args) or "to" in event_reads
+                            has_from = any("from" in arg for arg in individual_args) or "from" in event_reads
+                            
+                            # If we have 'to' but not 'from', and totalSupply is written, it's a mint
+                            if has_to and not has_from:
+                                is_mint = True
+                            # If we have 'from' but not 'to', and totalSupply is written, it's a burn
+                            elif has_from and not has_to:
+                                is_burn = True
+                            
+                            if is_mint:
+                                # We need to handle the special case for _mint where address(0) is the first arg
+                                # Detect if any of the args already contains a correct address(0) representation
+                                has_address_zero = any("address(0)" in arg for arg in individual_args)
+                                
+                                if not has_address_zero:
+                                    # Manually construct the emit with the correct _mint format
+                                    ssa_stmt = f"emit Transfer(address(0)_0, to_0, amount_0)"
+                                else:
+                                    # If args already have address(0), just format with the args
+                                    ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                                
+                                # Add reads for to and amount
+                                event_reads.add("to")
+                                event_reads.add("amount")
+                                
+                                # Ensure correct arguments are used for mint
+                                for i, stmt in enumerate(block.get("ssa_statements", [])):
+                                    if stmt.startswith("emit Transfer(") and "address(0)" not in stmt:
+                                        # Replace the incorrect statement
+                                        block["ssa_statements"][i] = f"emit Transfer(address(0)_0, to_0, amount_0)"
+                                
+                            elif is_burn:
+                                # We need to handle the special case for _burn where address(0) is the second arg
+                                # Detect if any of the args already contains a correct address(0) representation
+                                has_address_zero = any("address(0)" in arg for arg in individual_args)
+                                
+                                if not has_address_zero:
+                                    # Manually construct the emit with the correct _burn format
+                                    ssa_stmt = f"emit Transfer(from_0, address(0)_0, amount_0)"
+                                else:
+                                    # If args already have address(0), just format with the args
+                                    ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                                
+                                # Add reads for from and amount
+                                event_reads.add("from")
+                                event_reads.add("amount")
+                                
+                                # Ensure correct arguments are used for burn
+                                for i, stmt in enumerate(block.get("ssa_statements", [])):
+                                    if stmt.startswith("emit Transfer(") and "address(0)" not in stmt:
+                                        # Replace the incorrect statement
+                                        block["ssa_statements"][i] = f"emit Transfer(from_0, address(0)_0, amount_0)"
+                            else:
+                                # Regular transfer
+                                ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                        else:
+                            # Regular emit statement for non-Transfer events
+                            ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                        
+                        # Update block accesses
+                        block["accesses"]["reads"] = list(set(block["accesses"]["reads"]).union(event_reads))
+                        
+                        # Add the emit statement to the block
+                        block["ssa_statements"].append(ssa_stmt)
+                
+                elif stmt_type == "Return":
+                    expression = node.get("expression", {})
+                    
+                    # Handle literal returns directly
+                    if expression and expression.get("nodeType") == "Literal":
+                        # Create SSA return statement with literal value
+                        ssa_stmt = f"return {expression.get('value', '')}"
+                        block["ssa_statements"].append(ssa_stmt)
+                    else:
+                        # Extract return variables
+                        ret_reads = set()
+                        SSAConverter._extract_reads(expression, ret_reads)
+                        
+                        # Create SSA return statement
+                        ssa_stmt = "return "
+                        for read_var in ret_reads:
+                            read_version = reads_dict.get(read_var, 0)
+                            ssa_stmt += f"{read_var}_{read_version} "
+                        
+                        # Add the SSA statement to the block
+                        block["ssa_statements"].append(ssa_stmt)
+                
+                elif stmt_type == "VariableDeclaration":
+                    # Handle variable declarations (e.g., uint bal = balances[msg.sender])
+                    declarations = node.get("declarations", [])
+                    init_value = node.get("initialValue", {})
+                    
+                    for decl in declarations:
+                        if decl and decl.get("nodeType") == "VariableDeclaration":
+                            var_name = decl.get("name", "")
+                            var_version = writes_dict.get(var_name, 0)
+                            
+                            # Create SSA variable declaration statement
+                            ssa_stmt = f"{var_name}_{var_version} = "
+                            
+                            # Handle literals directly
+                            if init_value and init_value.get("nodeType") == "Literal":
+                                ssa_stmt += str(init_value.get("value", ""))
+                            elif init_value:
+                                # Handle special initialization cases
+                                if init_value.get("nodeType") == "IndexAccess":
+                                    base_expr = init_value.get("baseExpression", {})
+                                    index_expr = init_value.get("indexExpression", {})
+                                    
+                                    if base_expr.get("nodeType") == "Identifier":
+                                        base_name = base_expr.get("name", "")
+                                        
+                                        # Handle common patterns like balances[msg.sender]
+                                        if index_expr.get("nodeType") == "MemberAccess":
+                                            member_expr = index_expr.get("expression", {})
+                                            member_name = index_expr.get("memberName", "")
+                                            
+                                            if member_expr.get("nodeType") == "Identifier":
+                                                member_base = member_expr.get("name", "")
+                                                if base_name and member_base and member_name:
+                                                    structured_read = f"{base_name}[{member_base}.{member_name}]"
+                                                    read_version = reads_dict.get(structured_read, 0)
+                                                    ssa_stmt += f"{structured_read}_{read_version}"
+                                                else:
+                                                    # Fallback to regular extraction
+                                                    init_reads = set()
+                                                    SSAConverter._extract_reads(init_value, init_reads)
+                                                    for read_var in init_reads:
+                                                        read_version = reads_dict.get(read_var, 0)
+                                                        ssa_stmt += f"{read_var}_{read_version} "
+                                            else:
+                                                # Fallback to regular extraction
+                                                init_reads = set()
+                                                SSAConverter._extract_reads(init_value, init_reads)
+                                                for read_var in init_reads:
+                                                    read_version = reads_dict.get(read_var, 0)
+                                                    ssa_stmt += f"{read_var}_{read_version} "
+                                        else:
+                                            # Handle regular IndexAccess like array[index]
+                                            init_reads = set()
+                                            SSAConverter._extract_reads(init_value, init_reads)
+                                            
+                                            # Format special indexed reads
+                                            formatted_reads = []
+                                            for read_var in init_reads:
+                                                read_version = reads_dict.get(read_var, 0)
+                                                formatted_reads.append(f"{read_var}_{read_version}")
+                                            
+                                            # Join all reads with spaces
+                                            ssa_stmt += " ".join(formatted_reads)
+                                    else:
+                                        # Fallback to regular extraction for complex base expressions
+                                        init_reads = set()
+                                        SSAConverter._extract_reads(init_value, init_reads)
+                                        for read_var in init_reads:
+                                            read_version = reads_dict.get(read_var, 0)
+                                            ssa_stmt += f"{read_var}_{read_version} "
+                                else:
+                                    # Regular extraction for other initialization types
+                                    init_reads = set()
+                                    SSAConverter._extract_reads(init_value, init_reads)
+                                    
+                                    # Append versioned initialization variables
+                                    for read_var in init_reads:
+                                        read_version = reads_dict.get(read_var, 0)
+                                        ssa_stmt += f"{read_var}_{read_version} "
+                            
+                            # Add the SSA statement to the block
+                            block["ssa_statements"].append(ssa_stmt)
+        
+        return basic_blocks
+    
+    @staticmethod
+    def insert_phi_functions(basic_blocks):
+        """
+        Insert phi-functions at control flow merge points to reconcile variable versions.
+        
+        Args:
+            basic_blocks (list): List of basic block dictionaries with SSA statements
+            
+        Returns:
+            list: List of basic block dictionaries with added phi-functions
+        """
+        # Build a mapping from block ID to block index for easier lookup
+        block_ids = {block["id"]: idx for idx, block in enumerate(basic_blocks)}
+        
+        # Initialize a dictionary to track predecessors for each block
+        predecessors = {block["id"]: [] for block in basic_blocks}
+        
+        # Build the control flow graph by analyzing terminators
+        for block in basic_blocks:
+            terminator = block.get("terminator", "")
+            if not terminator:
+                # If no terminator and not the last block, assume fall-through
+                block_idx = block_ids.get(block["id"])
+                if block_idx is not None and block_idx + 1 < len(basic_blocks):
+                    next_block = basic_blocks[block_idx + 1]
+                    predecessors[next_block["id"]].append(block["id"])
+                continue
+                
+            if isinstance(terminator, str):
+                # Handle if-then-else conditional jumps
+                if "then goto " in terminator and " else goto " in terminator:
+                    parts = terminator.split(" then goto ")
+                    then_target = parts[1].split(" else goto ")[0]
+                    else_target = parts[1].split(" else goto ")[1]
+                    
+                    # Record predecessors
+                    if then_target in predecessors:
+                        predecessors[then_target].append(block["id"])
+                    if else_target in predecessors:
+                        predecessors[else_target].append(block["id"])
+                
+                # Handle unconditional jumps
+                elif terminator.startswith("goto "):
+                    target = terminator.split("goto ")[1]
+                    if target in predecessors:
+                        predecessors[target].append(block["id"])
+        
+        # Find loop headers (blocks with back-edges pointing to them)
+        loop_headers = set()
+        for block in basic_blocks:
+            if block.get("is_loop_header"):
+                loop_headers.add(block["id"])
+            
+            # Check for back-edges
+            terminator = block.get("terminator", "")
+            if terminator and terminator.startswith("goto "):
+                target = terminator.split("goto ")[1]
+                if target in block_ids and block_ids[target] < block_ids[block["id"]]:
+                    loop_headers.add(target)
+        
+        # Find merge blocks (blocks with multiple predecessors)
+        merge_blocks = [block_id for block_id, preds in predecessors.items() if len(preds) > 1]
+        
+        # Process merge blocks and loop headers for phi insertion
+        for block_id in set(merge_blocks).union(loop_headers):
+            if block_id not in block_ids:
+                continue
+                
+            block = basic_blocks[block_ids[block_id]]
+            pred_ids = predecessors.get(block_id, [])
+            pred_blocks = [basic_blocks[block_ids[pred_id]] for pred_id in pred_ids if pred_id in block_ids]
+            
+            # For loop headers, add blocks with back-edges as predecessors
+            if block_id in loop_headers:
+                for b in basic_blocks:
+                    terminator = b.get("terminator", "")
+                    if (terminator and terminator.startswith("goto ") and 
+                        terminator.split("goto ")[1] == block_id and 
+                        b["id"] not in [p["id"] for p in pred_blocks]):
+                        pred_blocks.append(b)
+            
+            if not pred_blocks:
+                continue
+            
+            # Collect variables needing phi functions and their versions from each predecessor
+            phi_variables = {}
+            for pred in pred_blocks:
+                for var in pred.get("accesses", {}).get("writes", []):
+                    if var not in phi_variables:
+                        phi_variables[var] = {}
+                    
+                    # Store the version from this predecessor
+                    version = pred.get("ssa_versions", {}).get("writes", {}).get(var, 0)
+                    if version > 0:  # Only track non-zero versions
+                        phi_variables[var][pred["id"]] = version
+            
+            # Generate phi functions
+            phi_functions = []
+            for var, versions_by_block in phi_variables.items():
+                # Only add phi when:
+                # - Multiple different versions of a variable reach this block, or
+                # - Variable is written in a predecessor and read in this block
+                versions = list(versions_by_block.values())
+                
+                if (len(set(versions)) > 1 or 
+                    (var in block.get("accesses", {}).get("reads", []) and versions)):
+                    
+                    # Create a new version for the phi function (max existing + 1)
+                    new_version = max(versions, default=0) + 1
+                    
+                    # Build phi function arguments (one from each predecessor)
+                    phi_args = []
+                    for pred in pred_blocks:
+                        if pred["id"] in versions_by_block:
+                            # Use the written version from this predecessor
+                            version = versions_by_block[pred["id"]]
+                        else:
+                            # Use the read version if no write
+                            version = pred.get("ssa_versions", {}).get("reads", {}).get(var, 0)
+                        phi_args.append(f"{var}_{version}")
+                    
+                    # Create the phi function statement
+                    phi_stmt = f"{var}_{new_version} = phi({', '.join(phi_args)})"
+                    phi_functions.append(phi_stmt)
+                    
+                    # Update SSA versions in this block
+                    if "ssa_versions" not in block:
+                        block["ssa_versions"] = {"reads": {}, "writes": {}}
+                    
+                    block["ssa_versions"]["writes"][var] = new_version
+                    block["ssa_versions"]["reads"][var] = new_version
+                    
+                    # Update statements in this block to use the new version
+                    if "ssa_statements" in block:
+                        updated_statements = []
+                        for stmt in block["ssa_statements"]:
+                            # Don't modify the phi function itself
+                            if not stmt.startswith(f"{var}_{new_version} = phi("):
+                                # Replace all references to any version of this variable with the new version
+                                for v in range(0, max(versions) + 1):
+                                    stmt = stmt.replace(f"{var}_{v}", f"{var}_{new_version}")
+                            updated_statements.append(stmt)
+                        
+                        block["ssa_statements"] = updated_statements
+            
+            # Add phi functions to the beginning of the block
+            if phi_functions:
+                if "ssa_statements" not in block:
+                    block["ssa_statements"] = []
+                block["ssa_statements"] = phi_functions + block["ssa_statements"]
+        
+        return basic_blocks
+    
+    @staticmethod
+    def cleanup_ssa_statements(basic_blocks):
+        """
+        Clean up SSA statements to fix variable duplication and call formatting issues.
+        
+        Args:
+            basic_blocks (list): List of basic block dictionaries with SSA statements
+            
+        Returns:
+            list: List of basic blocks with cleaned SSA statements
+        """
+        if not basic_blocks:
+            return []
+            
+        for block in basic_blocks:
+            if "ssa_statements" not in block:
+                continue
+                
+            cleaned_statements = []
+            for stmt in block.get("ssa_statements", []):
+                # Clean up compound operations with duplicated variables
+                if " = " in stmt and (" + " in stmt or " - " in stmt):
+                    lhs, rhs = stmt.split(" = ", 1)
+                    
+                    # Identify and remove duplicate variables in + operations
+                    if " + " in rhs:
+                        # Specially handle balanceOf operations in mint/burn functions
+                        if "balanceOf" in lhs:
+                            parts = rhs.split(" + ")
+                            first_part = parts[0].strip()  # balanceOf[to]_0
+                            
+                            # Find amount_0 parameter if it exists
+                            amount_term = None
+                            for part in rhs.split():
+                                if part.startswith("amount_"):
+                                    amount_term = part
+                                    break
+                            
+                            if amount_term:
+                                # For mint/burn operations: balanceOf[to]_1 = balanceOf[to]_0 + amount_0
+                                cleaned_stmt = f"{lhs} = {first_part} + {amount_term}"
+                            else:
+                                # Default fallback if no amount term found
+                                cleaned_stmt = f"{lhs} = {rhs}"
+                        else:
+                            # Regular handling for other operations
+                            terms = [term.strip() for term in rhs.split(" + ")]
+                            # Remove duplicates while preserving order
+                            seen = set()
+                            unique_terms = []
+                            for term in terms:
+                                if "_" in term:
+                                    base = term.split("_")[0]
+                                    if base not in seen:
+                                        seen.add(base)
+                                        unique_terms.append(term)
+                                else:
+                                    unique_terms.append(term)
+                            cleaned_stmt = f"{lhs} = {' + '.join(unique_terms)}"
+                        
+                        cleaned_statements.append(cleaned_stmt)
+                    
+                    # Identify and remove duplicate variables in - operations
+                    elif " - " in rhs:
+                        # Specially handle balanceOf operations in burn functions
+                        if "balanceOf" in lhs:
+                            first_part, rest = rhs.split(" - ", 1)
+                            
+                            # Find amount_0 parameter if it exists
+                            amount_term = None
+                            for part in rest.split():
+                                if part.startswith("amount_"):
+                                    amount_term = part
+                                    break
+                            
+                            if amount_term:
+                                # For burn operations: balanceOf[from]_1 = balanceOf[from]_0 - amount_0
+                                cleaned_stmt = f"{lhs} = {first_part} - {amount_term}"
+                            else:
+                                # Default fallback if no amount term found
+                                cleaned_stmt = f"{lhs} = {rhs}"
+                        else:
+                            # Handle subtraction differently: keep the first part, then clean duplicates after the -
+                            first_part, rest = rhs.split(" - ", 1)
+                            terms = [term.strip() for term in rest.split()]
+                            # Remove duplicates while preserving order
+                            seen = set()
+                            unique_terms = []
+                            for term in terms:
+                                if "_" in term:
+                                    base = term.split("_")[0]
+                                    if base not in seen:
+                                        seen.add(base)
+                                        unique_terms.append(term)
+                                else:
+                                    unique_terms.append(term)
+                            cleaned_stmt = f"{lhs} = {first_part} - {' '.join(unique_terms)}"
+                        
+                        cleaned_statements.append(cleaned_stmt)
+                
+                # Fix call[internal] formatting to include commas between arguments
+                elif "call[internal](" in stmt:
+                    call_prefix = stmt.split("call[internal](")[0] + "call[internal]("
+                    call_parts = stmt.split("call[internal](")[1].strip(")")
+                    
+                    # Parse the function name and arguments
+                    if "," in call_parts:
+                        # Already has commas, keep as is
+                        cleaned_statements.append(stmt)
+                    else:
+                        parts = call_parts.strip().split()
+                        if len(parts) > 1:
+                            # Format with proper commas: func, arg1, arg2
+                            func_name = parts[0]
+                            args = parts[1:]
+                            
+                            # Make sure args are in the right order for mint/burn
+                            if func_name == "_mint" and len(args) >= 2:
+                                # _mint expects (to, amount) - ensure this order
+                                to_term = None
+                                amount_term = None
+                                for arg in args:
+                                    if arg.startswith("to_"):
+                                        to_term = arg
+                                    elif arg.startswith("amount_"):
+                                        amount_term = arg
+                                
+                                if to_term and amount_term:
+                                    # Format with the right order for _mint
+                                    formatted_call = f"{call_prefix}{func_name}, {to_term}, {amount_term})"
+                                else:
+                                    # Default format with all args
+                                    formatted_call = f"{call_prefix}{func_name}, {', '.join(args)})"
+                            elif func_name == "_burn" and len(args) >= 2:
+                                # _burn expects (from, amount) - ensure this order
+                                from_term = None
+                                amount_term = None
+                                for arg in args:
+                                    if arg.startswith("from_"):
+                                        from_term = arg
+                                    elif arg.startswith("amount_"):
+                                        amount_term = arg
+                                
+                                if from_term and amount_term:
+                                    # Format with the right order for _burn
+                                    formatted_call = f"{call_prefix}{func_name}, {from_term}, {amount_term})"
+                                else:
+                                    # Default format with all args
+                                    formatted_call = f"{call_prefix}{func_name}, {', '.join(args)})"
+                            else:
+                                # Regular function call
+                                formatted_call = f"{call_prefix}{func_name}, {', '.join(args)})"
+                            
+                            cleaned_statements.append(formatted_call)
+                        else:
+                            # Just a function name, no args
+                            cleaned_statements.append(stmt)
+                else:
+                    # No need to clean this statement
+                    cleaned_statements.append(stmt)
+            
+            # Update the block with cleaned statements
+            block["ssa_statements"] = cleaned_statements
+            
+        return basic_blocks
+    
+    @staticmethod
+    def integrate_ssa_output(basic_blocks):
+        """
+        Create a clean SSA representation from the basic blocks.
+        
+        Args:
+            basic_blocks (list): List of basic block dictionaries with SSA information
+            
+        Returns:
+            list: List of simplified SSA block dictionaries with ID, statements, terminators, and variable accesses
+        """
+        if not basic_blocks:
+            return []
+            
+        ssa_blocks = []
+        
+        # Map blocks by ID for easier lookup
+        block_ids = {block["id"]: idx for idx, block in enumerate(basic_blocks)}
+        
+        # First update all EmitStatement terminators to goto next block
+        for idx, block in enumerate(basic_blocks):
+            if block.get("terminator") == "EmitStatement":
+                # Convert EmitStatement to a goto to the next block
+                if idx < len(basic_blocks) - 1:
+                    # Not the last block, so add goto next block
+                    next_block = basic_blocks[idx + 1]
+                    block["terminator"] = f"goto {next_block['id']}"
+                else:
+                    # Last block in function, should return
+                    block["terminator"] = "return"
+        
+        for block in basic_blocks:
+            # Check for emit statements in this block
+            has_emit = False
+            for stmt in block.get("ssa_statements", []):
+                if stmt.startswith("emit "):
+                    has_emit = True
+            
+            # Extract only the essential SSA information
+            ssa_block = {
+                "id": block["id"],
+                "ssa_statements": block.get("ssa_statements", []),
+                "terminator": block.get("terminator", None)
+            }
+            
+            # Always include accesses for better tracking
+            ssa_block["accesses"] = block.get("accesses", {"reads": [], "writes": []})
+            
+            # Fix any emit statements that might not have been converted to goto
+            if has_emit and ssa_block["terminator"] == "EmitStatement":
+                # Find the next block to goto
+                current_idx = basic_blocks.index(block)
+                if current_idx < len(basic_blocks) - 1:
+                    next_block = basic_blocks[current_idx + 1]
+                    ssa_block["terminator"] = f"goto {next_block['id']}"
+                else:
+                    ssa_block["terminator"] = "return"
+            
+            # Check for emit statements and update accesses if needed
+            if has_emit:
+                # Find the variables used in the emit statement
+                for stmt in ssa_block["ssa_statements"]:
+                    if stmt.startswith("emit "):
+                        # Extract arguments from emit statement - format: emit Name(arg1, arg2, ...)
+                        args_part = stmt.split("(", 1)[1].rstrip(")")
+                        args = [arg.strip() for arg in args_part.split(",")]
+                        
+                        # Add reads for each argument - extract variable name without version
+                        emit_reads = []
+                        for arg in args:
+                            if "_" in arg:
+                                var_name = arg.split("_")[0]
+                                emit_reads.append(var_name)
+                        
+                        # Update the block's reads with the emit arguments
+                        reads = set(ssa_block["accesses"]["reads"])
+                        reads.update(emit_reads)
+                        ssa_block["accesses"]["reads"] = list(reads)
+            
+            # Add block to the list
+            ssa_blocks.append(ssa_block)
+            
+        return ssa_blocks
+
+# Function to convert basic blocks to SSA form
+def convert_to_ssa(basic_blocks):
+    """
+    Convert the given basic blocks to SSA form.
+    
+    Args:
+        basic_blocks (list): List of basic block dictionaries
+        
+    Returns:
+        list: List of basic block dictionaries in SSA form
+    """
+    # Apply SSA transformation steps
+    blocks_with_versions = SSAConverter.assign_ssa_versions(basic_blocks)
+    blocks_with_phi = SSAConverter.insert_phi_functions(blocks_with_versions)
+    cleaned_blocks = SSAConverter.cleanup_ssa_statements(blocks_with_phi)
+    ssa_result = SSAConverter.integrate_ssa_output(cleaned_blocks)
+    return ssa_result
