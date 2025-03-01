@@ -51,6 +51,7 @@ class ControlFlowRefiner:
             if block.get("terminator") == "Revert":
                 # Update the terminator to the explicit "revert" value
                 block["terminator"] = "revert"
+                # Don't add a goto after a revert - it's a true terminator
                 continue
             
             # Special handling for emit statements
@@ -149,6 +150,20 @@ class ControlFlowRefiner:
         if_statement = block["statements"][if_idx]
         condition = if_statement["node"].get("condition", {})
         
+        # Extract condition variables for accesses tracking
+        condition_reads = set()
+        if condition.get("nodeType") == "BinaryOperation":
+            left_expr = condition.get("leftExpression", {})
+            right_expr = condition.get("rightExpression", {})
+            
+            # Process left expression
+            if left_expr.get("nodeType") == "Identifier":
+                condition_reads.add(left_expr.get("name", ""))
+            
+            # Process right expression
+            if right_expr.get("nodeType") == "Identifier":
+                condition_reads.add(right_expr.get("name", ""))
+        
         # Extract statements before the if
         pre_if_statements = block["statements"][:if_idx]
         
@@ -156,7 +171,11 @@ class ControlFlowRefiner:
         conditional_block = {
             "id": block["id"],
             "statements": pre_if_statements + [if_statement],
-            "terminator": "conditional"
+            "terminator": "conditional",
+            "accesses": {
+                "reads": list(condition_reads),
+                "writes": []
+            }
         }
         
         # Create true branch block
@@ -169,16 +188,35 @@ class ControlFlowRefiner:
         
         # Check if the true branch contains a revert statement
         contains_revert = False
+        true_reads = set()
+        true_writes = set()
         for stmt in true_typed_statements:
             if stmt["type"] == "Revert":
                 contains_revert = True
+                # Extract revert arguments for access tracking
+                if stmt["node"].get("expression", {}).get("nodeType") == "FunctionCall":
+                    func_expr = stmt["node"].get("expression", {})
+                    for arg in func_expr.get("arguments", []):
+                        if arg.get("nodeType") == "Identifier":
+                            true_reads.add(arg.get("name", ""))
+                        elif arg.get("nodeType") == "BinaryOperation":
+                            left = arg.get("leftExpression", {})
+                            right = arg.get("rightExpression", {})
+                            if left.get("nodeType") == "Identifier":
+                                true_reads.add(left.get("name", ""))
+                            if right.get("nodeType") == "Identifier":
+                                true_reads.add(right.get("name", ""))
                 break
         
         true_block = {
             "id": true_block_id,
             "statements": true_typed_statements,
             "terminator": "revert" if contains_revert else None,
-            "branch_type": "true"
+            "branch_type": "true",
+            "accesses": {
+                "reads": list(true_reads),
+                "writes": list(true_writes)
+            }
         }
         
         # Create false branch block
@@ -189,47 +227,95 @@ class ControlFlowRefiner:
         false_statements = false_body.get("statements", []) if false_body else []
         false_typed_statements = self._get_typed_statements(false_statements)
         
+        # Check if the false branch contains a revert
+        false_has_revert = False
+        false_reads = set()
+        false_writes = set()
+        for stmt in false_typed_statements:
+            if stmt["type"] == "Revert":
+                false_has_revert = True
+                # Extract revert arguments for access tracking
+                if stmt["node"].get("expression", {}).get("nodeType") == "FunctionCall":
+                    func_expr = stmt["node"].get("expression", {})
+                    for arg in func_expr.get("arguments", []):
+                        if arg.get("nodeType") == "Identifier":
+                            false_reads.add(arg.get("name", ""))
+                        elif arg.get("nodeType") == "BinaryOperation":
+                            left = arg.get("leftExpression", {})
+                            right = arg.get("rightExpression", {})
+                            if left.get("nodeType") == "Identifier":
+                                false_reads.add(left.get("name", ""))
+                            if right.get("nodeType") == "Identifier":
+                                false_reads.add(right.get("name", ""))
+                break
+        
         false_block = {
             "id": false_block_id,
             "statements": false_typed_statements,
-            "terminator": None,
-            "branch_type": "false"
+            "terminator": "revert" if false_has_revert else None,
+            "branch_type": "false",
+            "accesses": {
+                "reads": list(false_reads),
+                "writes": list(false_writes)
+            }
         }
         
-        # Update the conditional block's terminator with goto information
-        conditional_block["terminator"] = f"if {condition} then goto {true_block_id} else goto {false_block_id}"
+        # Check if we have a revert in either branch - this is key for merging blocks correctly
+        true_has_revert = contains_revert
+        true_has_content = len(true_typed_statements) > 0
+        false_has_content = len(false_typed_statements) > 0
         
-        # Connect branches to next block if it exists
+        # Connect to next block if it exists
         next_block_id = basic_blocks[block_idx + 1]["id"] if block_idx + 1 < len(basic_blocks) else None
-        if next_block_id:
-            # If true block contains a revert, we don't need to add a goto
-            if not true_block["terminator"]:
-                true_block["terminator"] = f"goto {next_block_id}"
-            if not false_block["terminator"]:
-                false_block["terminator"] = f"goto {next_block_id}"
-                
-        # Skip adding empty blocks
+        
+        # Set terminators for each block
+        # If branch has revert, set it properly as a real terminator, not a goto
+        if true_has_revert:
+            true_block["terminator"] = "revert"
+        elif next_block_id and true_has_content:
+            true_block["terminator"] = f"goto {next_block_id}"
+            
+        if false_has_revert:
+            false_block["terminator"] = "revert"
+        elif next_block_id and false_has_content:
+            false_block["terminator"] = f"goto {next_block_id}"
+        
+        # Add conditional block to output
         new_blocks.append(conditional_block)
         
-        # Only add true block if it has statements or a terminator
-        if true_block["statements"] or true_block["terminator"] == "revert":
-            new_blocks.append(true_block)
+        # Determine where branches should point
+        if true_has_content or true_has_revert:
+            # True branch has content or is a revert, use it
+            if false_has_content or false_has_revert:
+                # Both branches have content, point to them
+                conditional_block["terminator"] = f"if {condition} then goto {true_block_id} else goto {false_block_id}"
+                new_blocks.append(true_block)
+                new_blocks.append(false_block)
+            else:
+                # Only true branch has content
+                if next_block_id:
+                    conditional_block["terminator"] = f"if {condition} then goto {true_block_id} else goto {next_block_id}"
+                else:
+                    # No next block, use return as terminator for false branch
+                    conditional_block["terminator"] = f"if {condition} then goto {true_block_id} else return"
+                new_blocks.append(true_block)  # Only add true block
+            
+        elif false_has_content or false_has_revert:
+            # Only false branch has content
+            if next_block_id:
+                conditional_block["terminator"] = f"if {condition} then goto {next_block_id} else goto {false_block_id}"
+            else:
+                # No next block, use return as terminator for true branch
+                conditional_block["terminator"] = f"if {condition} then return else goto {false_block_id}"
+            new_blocks.append(false_block)  # Only add false block
+            
         else:
-            # Update conditional block terminator to skip empty true block
-            if "then goto" in conditional_block["terminator"] and "else goto" in conditional_block["terminator"]:
-                conditional_block["terminator"] = conditional_block["terminator"].replace(
-                    f"then goto {true_block_id}", f"then goto {next_block_id}"
-                )
-        
-        # Only add false block if it has statements
-        if false_block["statements"]:
-            new_blocks.append(false_block)
-        else:
-            # Update conditional block terminator to skip empty false block
-            if "then goto" in conditional_block["terminator"] and "else goto" in conditional_block["terminator"]:
-                conditional_block["terminator"] = conditional_block["terminator"].replace(
-                    f"else goto {false_block_id}", f"else goto {next_block_id}"
-                )
+            # Neither branch has content, skip both
+            if next_block_id:
+                conditional_block["terminator"] = f"goto {next_block_id}"
+            else:
+                # No next block, just return
+                conditional_block["terminator"] = "return"
         
         return new_blocks, block_counter
     

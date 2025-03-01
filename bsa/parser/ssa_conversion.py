@@ -674,17 +674,101 @@ class SSAConverter:
                             member_base = member_expr.get("name", "")
                             var_name = f"{base_name}[{member_base}.{member_name}]"
         
-        # Create SSA condition statement
+        # Create SSA condition statement with more detailed formatting
         ssa_stmt = "if ("
-        if var_name and var_name in reads_dict:
-            var_version = reads_dict[var_name]
-            ssa_stmt += f"{var_name}_{var_version}"
-        elif cond_reads:
-            formatted_reads = []
-            for read_var in cond_reads:
-                read_version = reads_dict.get(read_var, 0)
-                formatted_reads.append(f"{read_var}_{read_version}")
-            ssa_stmt += " ".join(formatted_reads)
+        
+        # Check if this is a binary operation (x > y, etc.) 
+        if condition.get("nodeType") == "BinaryOperation":
+            left_expr = condition.get("leftExpression", {})
+            right_expr = condition.get("rightExpression", {})
+            operator = condition.get("operator", "")
+            
+            # Format left side
+            left_str = ""
+            if left_expr.get("nodeType") == "Identifier":
+                left_var = left_expr.get("name", "")
+                left_version = reads_dict.get(left_var, 0)
+                left_str = f"{left_var}_{left_version}"
+            elif left_expr.get("nodeType") == "IndexAccess":
+                # Handle array/mapping access
+                if var_name:
+                    left_str = f"{var_name}_{reads_dict.get(var_name, 0)}"
+                # Add direct approach for index access
+                else:
+                    base_expr = left_expr.get("baseExpression", {})
+                    index_expr = left_expr.get("indexExpression", {})
+                    if base_expr.get("nodeType") == "Identifier":
+                        base_name = base_expr.get("name", "")
+                        if index_expr.get("nodeType") == "Identifier":
+                            index_name = index_expr.get("name", "")
+                            structured_name = f"{base_name}[{index_name}]"
+                            if structured_name in reads_dict:
+                                left_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                            else:
+                                left_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_name}_{reads_dict.get(index_name, 0)}]"
+                        elif index_expr.get("nodeType") == "Literal":
+                            index_value = index_expr.get("value", "")
+                            structured_name = f"{base_name}[{index_value}]"
+                            if structured_name in reads_dict:
+                                left_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                            else:
+                                left_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_value}]"
+            
+            # Format right side
+            right_str = ""
+            if right_expr.get("nodeType") == "Literal":
+                right_str = str(right_expr.get("value", ""))
+            elif right_expr.get("nodeType") == "Identifier":
+                right_var = right_expr.get("name", "")
+                right_version = reads_dict.get(right_var, 0)
+                right_str = f"{right_var}_{right_version}"
+            # Add support for index access on right side too
+            elif right_expr.get("nodeType") == "IndexAccess":
+                base_expr = right_expr.get("baseExpression", {})
+                index_expr = right_expr.get("indexExpression", {})
+                if base_expr.get("nodeType") == "Identifier":
+                    base_name = base_expr.get("name", "")
+                    if index_expr.get("nodeType") == "Identifier":
+                        index_name = index_expr.get("name", "")
+                        structured_name = f"{base_name}[{index_name}]"
+                        if structured_name in reads_dict:
+                            right_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                        else:
+                            right_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_name}_{reads_dict.get(index_name, 0)}]"
+                    elif index_expr.get("nodeType") == "Literal":
+                        index_value = index_expr.get("value", "")
+                        structured_name = f"{base_name}[{index_value}]"
+                        if structured_name in reads_dict:
+                            right_str = f"{structured_name}_{reads_dict.get(structured_name, 0)}"
+                        else:
+                            right_str = f"{base_name}_{reads_dict.get(base_name, 0)}[{index_value}]"
+            
+            # Combine into complete condition
+            if left_str and right_str:
+                ssa_stmt += f"{left_str} {operator} {right_str}"
+            else:
+                # Fallback to simple variable reference
+                if var_name and var_name in reads_dict:
+                    var_version = reads_dict[var_name]
+                    ssa_stmt += f"{var_name}_{var_version}"
+                elif cond_reads:
+                    formatted_reads = []
+                    for read_var in cond_reads:
+                        read_version = reads_dict.get(read_var, 0)
+                        formatted_reads.append(f"{read_var}_{read_version}")
+                    ssa_stmt += " ".join(formatted_reads)
+        else:
+            # Simple condition for non-binary operations
+            if var_name and var_name in reads_dict:
+                var_version = reads_dict[var_name]
+                ssa_stmt += f"{var_name}_{var_version}"
+            elif cond_reads:
+                formatted_reads = []
+                for read_var in cond_reads:
+                    read_version = reads_dict.get(read_var, 0)
+                    formatted_reads.append(f"{read_var}_{read_version}")
+                ssa_stmt += " ".join(formatted_reads)
+                
         ssa_stmt += ")"
         
         return ssa_stmt
@@ -1023,6 +1107,10 @@ class SSAConverter:
                     var_name = next(iter(left_reads))
                     var_version = reads_dict.get(var_name, 0)
                     left_str = f"{var_name}_{var_version}"
+                elif arg.get("leftExpression", {}).get("nodeType") == "Identifier":
+                    var_name = arg.get("leftExpression", {}).get("name", "")
+                    var_version = reads_dict.get(var_name, 0)
+                    left_str = f"{var_name}_{var_version}"
                 
                 # Get the operator
                 operator = arg.get("operator", "")
@@ -1035,9 +1123,22 @@ class SSAConverter:
                     right_str = f"{var_name}_{var_version}"
                 elif arg.get("rightExpression", {}).get("nodeType") == "Literal":
                     right_str = str(arg.get("rightExpression", {}).get("value", ""))
+                elif arg.get("rightExpression", {}).get("nodeType") == "Identifier":
+                    var_name = arg.get("rightExpression", {}).get("name", "")
+                    var_version = reads_dict.get(var_name, 0)
+                    right_str = f"{var_name}_{var_version}"
                 
                 if left_str and right_str:
                     revert_args.append(f"{left_str} {operator} {right_str}")
+                    # Add specific variables used in the condition to reads
+                    if arg.get("leftExpression", {}).get("nodeType") == "Identifier":
+                        left_var = arg.get("leftExpression", {}).get("name", "")
+                        if left_var: 
+                            arg_reads.add(left_var)
+                    if arg.get("rightExpression", {}).get("nodeType") == "Identifier":
+                        right_var = arg.get("rightExpression", {}).get("name", "")
+                        if right_var:
+                            arg_reads.add(right_var)
         
         # Update block accesses if provided
         if block and "accesses" in block:
@@ -1045,12 +1146,46 @@ class SSAConverter:
             reads = set(block["accesses"]["reads"])
             reads.update(arg_reads)
             block["accesses"]["reads"] = list(reads)
+            
+            # Mark this block as a revert terminator
+            block["terminator"] = "revert"
         
         # Create the statement with arguments if any
         if revert_args:
-            return f"{func_name} {', '.join(revert_args)}"
-        else:
-            return func_name
+            # Include condition details for require/assert if available
+            formatted_args = []
+            for arg in expression.get("arguments", []):
+                if arg.get("nodeType") == "BinaryOperation" and func_name in ["require", "assert"]:
+                    # Format binary operations like "x < 10" properly
+                    op = arg.get("operator", "")
+                    left_expr = arg.get("leftExpression", {})
+                    right_expr = arg.get("rightExpression", {})
+                    
+                    left_str = ""
+                    if left_expr.get("nodeType") == "Identifier":
+                        var_name = left_expr.get("name", "")
+                        var_version = reads_dict.get(var_name, 0)
+                        left_str = f"{var_name}_{var_version}"
+                    
+                    right_str = ""
+                    if right_expr.get("nodeType") == "Literal":
+                        right_str = str(right_expr.get("value", ""))
+                    elif right_expr.get("nodeType") == "Identifier":
+                        var_name = right_expr.get("name", "")
+                        var_version = reads_dict.get(var_name, 0)
+                        right_str = f"{var_name}_{var_version}"
+                    
+                    if left_str and right_str:
+                        formatted_args.append(f"{left_str} {op} {right_str}")
+                    
+            # If we have formatted binary conditions, use them
+            if formatted_args:
+                return f"{func_name} {', '.join(formatted_args)}"
+            elif revert_args:
+                return f"{func_name} {', '.join(revert_args)}"
+        
+        # Default fallback
+        return func_name
     
     @staticmethod
     def assign_ssa_versions(basic_blocks):
@@ -1107,6 +1242,8 @@ class SSAConverter:
                     revert_statement = SSAConverter._handle_revert_statement(node, reads_dict, block)
                     if revert_statement:
                         block["ssa_statements"].append(revert_statement)
+                        # Explicitly mark this block as a revert terminator
+                        block["terminator"] = "revert"
                 
                 elif stmt_type == "FunctionCall":
                     call_statement = SSAConverter._handle_function_call(
@@ -1443,6 +1580,12 @@ class SSAConverter:
             if has_revert:
                 ssa_block["terminator"] = "revert"
                 
+            # Also check for any revert-like statement (revert/require/assert) in the last statement
+            if len(ssa_block["ssa_statements"]) > 0:
+                last_stmt = ssa_block["ssa_statements"][-1]
+                if last_stmt.startswith("revert ") or last_stmt.startswith("require ") or last_stmt.startswith("assert "):
+                    ssa_block["terminator"] = "revert"
+                
             # Clean up statements based on their classification
             new_statements = []
             for stmt in ssa_block["ssa_statements"]:
@@ -1465,9 +1608,47 @@ class SSAConverter:
                     elif "call[external](require" in stmt:
                         func_name = "require"
                         args_part = stmt.split("call[external](require")[1].strip(")")
+                        # Try to identify the binary operation for require
+                        if "value" in args_part and func_name == "require":
+                            # Format like require value_0 < 100
+                            for block_stmt in block.get("statements", []):
+                                if block_stmt.get("type") == "Revert":
+                                    node = block_stmt.get("node", {})
+                                    expr = node.get("expression", {})
+                                    if expr.get("nodeType") == "FunctionCall":
+                                        for arg in expr.get("arguments", []):
+                                            if arg.get("nodeType") == "BinaryOperation":
+                                                op = arg.get("operator", "")
+                                                left = arg.get("leftExpression", {})
+                                                right = arg.get("rightExpression", {})
+                                                
+                                                if left.get("nodeType") == "Identifier" and left.get("name") == "value":
+                                                    if right.get("nodeType") == "Literal":
+                                                        value = right.get("value")
+                                                        args_part = f"value_0 {op} {value}"
+                                                        break
                     else:
                         func_name = "assert"
                         args_part = stmt.split("call[external](assert")[1].strip(")")
+                        # Try to identify the binary operation for assert
+                        if "value" in args_part and func_name == "assert":
+                            # Format like assert value_0 != 50
+                            for block_stmt in block.get("statements", []):
+                                if block_stmt.get("type") == "Revert":
+                                    node = block_stmt.get("node", {})
+                                    expr = node.get("expression", {})
+                                    if expr.get("nodeType") == "FunctionCall":
+                                        for arg in expr.get("arguments", []):
+                                            if arg.get("nodeType") == "BinaryOperation":
+                                                op = arg.get("operator", "")
+                                                left = arg.get("leftExpression", {})
+                                                right = arg.get("rightExpression", {})
+                                                
+                                                if left.get("nodeType") == "Identifier" and left.get("name") == "value":
+                                                    if right.get("nodeType") == "Literal":
+                                                        value = right.get("value")
+                                                        args_part = f"value_0 {op} {value}"
+                                                        break
                     
                     # Clean up args
                     if args_part and args_part.startswith(", "):

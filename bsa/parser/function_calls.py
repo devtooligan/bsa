@@ -102,8 +102,8 @@ def classify_and_add_calls(basic_blocks, function_map):
                     # Direct function call: foo()
                     call_name = func_expr.get("name", "unknown")
                     
-                    # Special handling for revert/require
-                    if call_name in ["revert", "require"]:
+                    # Special handling for revert/require/assert
+                    if call_name in ["revert", "require", "assert"]:
                         # Process them but mark as "revert" call type, not "external"
                         call_type = "revert"
                         
