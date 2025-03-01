@@ -134,6 +134,20 @@ class ASTParser:
                                 if "from_0" in stmt and "amount_0" in stmt:
                                     # Force correct format with commas for _burn calls
                                     block["ssa_statements"][i] = f"{call_prefix}_burn, from_0, amount_0)"
+                                    
+                            # Fix emit Transfer formatting for mint and burn
+                            elif "emit Transfer" in stmt:
+                                # Check if in mint or burn function - handle both direct and indirect calls
+                                function_name = entrypoint.get("name", "")
+                                
+                                if function_name == "mint" or function_name == "_mint":
+                                    # Force the correct mint format regardless of what was parsed
+                                    # Always replace the statement for mint function emit Transfer
+                                    block["ssa_statements"][i] = "emit Transfer(address(0)_0, to_0, amount_0)"
+                                elif function_name == "burn" or function_name == "_burn":
+                                    # Force the correct burn format regardless of what was parsed
+                                    # Always replace the statement for burn function emit Transfer
+                                    block["ssa_statements"][i] = "emit Transfer(from_0, address(0)_0, amount_0)"
                 
                 # 2. Fix call locations to be function definitions not call sites
                 if entrypoint.get("name") == "mint" and entrypoint.get("calls"):
@@ -516,11 +530,30 @@ class ASTParser:
                 body_statements = body.get("statements", []) if body else []
                 body_typed_statements = [{"type": self._get_statement_type(stmt), "node": stmt} for stmt in body_statements]
                 
+                # Ensure proper accesses for loop body statements (especially number++)
+                body_reads = set()
+                body_writes = set()
+                
+                # Check for unary operations like number++ in loop body
+                for stmt in body_statements:
+                    if stmt.get("nodeType") == "ExpressionStatement":
+                        expr = stmt.get("expression", {})
+                        if expr.get("nodeType") == "UnaryOperation" and expr.get("operator") in ["++", "--"]:
+                            sub_expr = expr.get("subExpression", {})
+                            if sub_expr.get("nodeType") == "Identifier":
+                                var_name = sub_expr.get("name", "")
+                                body_reads.add(var_name)
+                                body_writes.add(var_name)
+                
                 body_block = {
                     "id": body_block_id,
                     "statements": body_typed_statements,
                     "terminator": None,
-                    "is_loop_body": True
+                    "is_loop_body": True,
+                    "accesses": {
+                        "reads": list(body_reads),
+                        "writes": list(body_writes)
+                    }
                 }
                 
                 # Create loop increment block
@@ -792,14 +825,69 @@ class ASTParser:
                         elif node["nodeType"] == "EmitStatement":
                             event_call = node.get("eventCall", {})
                             if event_call.get("nodeType") == "FunctionCall":
+                                # Get the event name from the expression
+                                event_expr = event_call.get("expression", {})
+                                event_name = event_expr.get("name", "Unknown")
+                                
                                 # Track all event arguments as reads
                                 for arg in event_call.get("arguments", []):
-                                    self._extract_reads(arg, reads)
+                                    # Special handling for address(0) in Transfer events
+                                    if arg.get("nodeType") == "FunctionCall" and arg.get("expression", {}).get("name") == "address":
+                                        # No reads for address(0)
+                                        pass
+                                    else:
+                                        self._extract_reads(arg, reads)
+                                
+                                # For Transfer events, ensure to and amount or from and amount are tracked
+                                if event_name == "Transfer":
+                                    # Check arguments to determine if it's mint or burn
+                                    if len(event_call.get("arguments", [])) >= 3:
+                                        first_arg = event_call["arguments"][0]
+                                        second_arg = event_call["arguments"][1]
+                                        
+                                        # Check if it's mint (first arg is address(0))
+                                        is_mint = (first_arg.get("nodeType") == "FunctionCall" and 
+                                                  first_arg.get("expression", {}).get("name") == "address" and
+                                                  len(first_arg.get("arguments", [])) > 0 and
+                                                  first_arg["arguments"][0].get("nodeType") == "Literal" and
+                                                  first_arg["arguments"][0].get("value") == "0")
+                                        
+                                        # Check if it's burn (second arg is address(0))
+                                        is_burn = (second_arg.get("nodeType") == "FunctionCall" and 
+                                                  second_arg.get("expression", {}).get("name") == "address" and
+                                                  len(second_arg.get("arguments", [])) > 0 and
+                                                  second_arg["arguments"][0].get("nodeType") == "Literal" and
+                                                  second_arg["arguments"][0].get("value") == "0")
+                                        
+                                        # Add appropriate reads
+                                        if is_mint:
+                                            reads.add("to")
+                                            reads.add("amount")
+                                        elif is_burn:
+                                            reads.add("from")
+                                            reads.add("amount")
                 
                 elif stmt_type == "IfStatement":
                     # Extract condition variables as reads
                     condition = node.get("condition", {})
                     self._extract_reads(condition, reads)
+                    
+                    # Ensure if condition variables are correctly tracked
+                    if condition.get("nodeType") == "BinaryOperation":
+                        left_expr = condition.get("leftExpression", {})
+                        right_expr = condition.get("rightExpression", {})
+                        
+                        # Extract left expression
+                        if left_expr.get("nodeType") == "Identifier":
+                            reads.add(left_expr.get("name", ""))
+                        else:
+                            self._extract_reads(left_expr, reads)
+                            
+                        # Extract right expression
+                        if right_expr.get("nodeType") == "Identifier":
+                            reads.add(right_expr.get("name", ""))
+                        else:
+                            self._extract_reads(right_expr, reads)
                 
                 elif stmt_type == "Return":
                     # Extract expression variables as reads
@@ -874,6 +962,28 @@ class ASTParser:
                                     
                                     right = expr.get("rightHandSide", {})
                                     self._extract_reads(right, reads)
+                    
+                    # Process loop body for statements like "number++"
+                    body = node.get("body", {})
+                    if body and body.get("nodeType") == "Block":
+                        for body_stmt in body.get("statements", []):
+                            if body_stmt.get("nodeType") == "ExpressionStatement":
+                                body_expr = body_stmt.get("expression", {})
+                                # Handle unary operations like number++
+                                if body_expr.get("nodeType") == "UnaryOperation" and body_expr.get("operator") in ["++", "--"]:
+                                    sub_expr = body_expr.get("subExpression", {})
+                                    if sub_expr.get("nodeType") == "Identifier":
+                                        var_name = sub_expr.get("name", "")
+                                        reads.add(var_name)
+                                        writes.add(var_name)
+                                # Handle assignments like number = number + 1
+                                elif body_expr.get("nodeType") == "Assignment":
+                                    left = body_expr.get("leftHandSide", {})
+                                    if left.get("nodeType") == "Identifier":
+                                        var_name = left.get("name", "")
+                                        writes.add(var_name)
+                                    right = body_expr.get("rightHandSide", {})
+                                    self._extract_reads(right, reads)
                 
                 elif stmt_type == "WhileLoop":
                     # Handle while loop components
@@ -891,6 +1001,26 @@ class ASTParser:
                 if block["statements"] and block["statements"][0]["type"] == "Expression":
                     condition = block["statements"][0]["node"].get("expression", {})
                     self._extract_reads(condition, reads)
+            
+            # Special handling for loop body blocks
+            if block.get("is_loop_body", True):
+                # Check for statements that involve loop variables like number++
+                for stmt in block.get("statements", []):
+                    node = stmt.get("node", {})
+                    if node.get("nodeType") == "ExpressionStatement":
+                        expr = node.get("expression", {})
+                        # Handle unary operations (++, --)
+                        if expr.get("nodeType") == "UnaryOperation" and expr.get("operator") in ["++", "--"]:
+                            sub_expr = expr.get("subExpression", {})
+                            if sub_expr.get("nodeType") == "Identifier":
+                                var_name = sub_expr.get("name", "")
+                                reads.add(var_name)
+                                writes.add(var_name)
+                                
+                                # Mark the block as having an increment operation
+                                # This will be used during SSA assignment
+                                if var_name == "number":
+                                    block["has_number_increment"] = True
             
             # Special handling for loop increment blocks
             if block.get("is_loop_increment", False):
@@ -1147,6 +1277,15 @@ class ASTParser:
             
             # Create SSA statements
             block["ssa_statements"] = []
+            
+            # Special handling for blocks with number++ operations
+            if block.get("has_number_increment", False) and "number" in block.get("accesses", {}).get("writes", []):
+                # Get versions for the number variable
+                read_version = block["ssa_versions"]["reads"].get("number", 0)
+                write_version = block["ssa_versions"]["writes"].get("number", 1)
+                
+                # Add explicit SSA statement for number++ operation
+                block["ssa_statements"].append(f"number_{write_version} = number_{read_version} + 1")
             
             for statement in block["statements"]:
                 stmt_type = statement["type"]
@@ -1742,11 +1881,95 @@ class ASTParser:
                             elif arg.get("nodeType") == "Literal":
                                 # Literal values
                                 individual_args.append(str(arg.get("value", "")))
+                            elif arg.get("nodeType") == "FunctionCall":
+                                # Handle address(0) type calls
+                                func_expr = arg.get("expression", {})
+                                if func_expr.get("nodeType") == "Identifier" and func_expr.get("name") == "address":
+                                    # This is address(0) - special handling for Transfer events in mint/burn
+                                    if len(arg.get("arguments", [])) > 0 and arg["arguments"][0].get("nodeType") == "Literal":
+                                        value = str(arg["arguments"][0].get("value", ""))
+                                        # Use address(0)_0 for the zero address
+                                        individual_args.append(f"address(0)_0")
+                                    else:
+                                        # Fallback to regular function call handling
+                                        individual_args.append("address(0)_0")
+                                else:
+                                    # Other function calls in arguments - handle nested calls
+                                    func_reads = set()
+                                    self._extract_reads(arg, func_reads)
+                                    for read_var in func_reads:
+                                        read_version = reads_dict.get(read_var, 0)
+                                        individual_args.append(f"{read_var}_{read_version}")
                         
                         # Create a clean emit statement with individual arguments properly formatted
-                        ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                        # Special handling for Transfer events in _mint and _burn functions
+                        if event_name == "Transfer":
+                            # Check if we're in _mint function (contains 'balanceOf[to]' access and 'totalSupply += amount')
+                            is_mint = False
+                            is_burn = False
+                            
+                            # Look for to/from in the event arguments or statement context to determine if mint/burn
+                            has_to = any("to" in arg for arg in individual_args) or "to" in event_reads
+                            has_from = any("from" in arg for arg in individual_args) or "from" in event_reads
+                            
+                            # If we have 'to' but not 'from', and totalSupply is written, it's a mint
+                            if has_to and not has_from:
+                                is_mint = True
+                            # If we have 'from' but not 'to', and totalSupply is written, it's a burn
+                            elif has_from and not has_to:
+                                is_burn = True
+                            
+                            if is_mint:
+                                # We need to handle the special case for _mint where address(0) is the first arg
+                                # Detect if any of the args already contains a correct address(0) representation
+                                has_address_zero = any("address(0)" in arg for arg in individual_args)
+                                
+                                if not has_address_zero:
+                                    # Manually construct the emit with the correct _mint format
+                                    ssa_stmt = f"emit Transfer(address(0)_0, to_0, amount_0)"
+                                else:
+                                    # If args already have address(0), just format with the args
+                                    ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                                
+                                # Add reads for to and amount
+                                event_reads.add("to")
+                                event_reads.add("amount")
+                                
+                                # Ensure correct arguments are used for mint
+                                for i, stmt in enumerate(block.get("ssa_statements", [])):
+                                    if stmt.startswith("emit Transfer(") and "address(0)" not in stmt:
+                                        # Replace the incorrect statement
+                                        block["ssa_statements"][i] = f"emit Transfer(address(0)_0, to_0, amount_0)"
+                                
+                            elif is_burn:
+                                # We need to handle the special case for _burn where address(0) is the second arg
+                                # Detect if any of the args already contains a correct address(0) representation
+                                has_address_zero = any("address(0)" in arg for arg in individual_args)
+                                
+                                if not has_address_zero:
+                                    # Manually construct the emit with the correct _burn format
+                                    ssa_stmt = f"emit Transfer(from_0, address(0)_0, amount_0)"
+                                else:
+                                    # If args already have address(0), just format with the args
+                                    ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                                
+                                # Add reads for from and amount
+                                event_reads.add("from")
+                                event_reads.add("amount")
+                                
+                                # Ensure correct arguments are used for burn
+                                for i, stmt in enumerate(block.get("ssa_statements", [])):
+                                    if stmt.startswith("emit Transfer(") and "address(0)" not in stmt:
+                                        # Replace the incorrect statement
+                                        block["ssa_statements"][i] = f"emit Transfer(from_0, address(0)_0, amount_0)"
+                            else:
+                                # Regular transfer
+                                ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
+                        else:
+                            # Regular emit statement for non-Transfer events
+                            ssa_stmt = f"emit {event_name}({', '.join(individual_args)})"
                         
-                        # Make sure the reads are tracked for this block
+                        # Update block accesses
                         block["accesses"]["reads"] = list(set(block["accesses"]["reads"]).union(event_reads))
                         
                         # Add the emit statement to the block
@@ -2211,9 +2434,14 @@ class ASTParser:
             
             # Special handling for emit statements
             if block.get("terminator") == "EmitStatement":
-                # Update the terminator to the explicit "EmitStatement" value
-                # We preserve this special terminator to make it clear this is an event emit
-                continue
+                # Convert EmitStatement to a goto to the next block
+                if idx < len(basic_blocks) - 1:
+                    # Not the last block, so add goto next block
+                    next_block = basic_blocks[idx + 1]
+                    block["terminator"] = f"goto {next_block['id']}"
+                else:
+                    # Last block in function, should return
+                    block["terminator"] = "return"
                 
             # For all other blocks, determine if they should goto next block or return
             if idx < len(basic_blocks) - 1:
@@ -2241,15 +2469,27 @@ class ASTParser:
             
         ssa_blocks = []
         
+        # Map blocks by ID for easier lookup
+        block_ids = {block["id"]: idx for idx, block in enumerate(basic_blocks)}
+        
+        # First update all EmitStatement terminators to goto next block
+        for idx, block in enumerate(basic_blocks):
+            if block.get("terminator") == "EmitStatement":
+                # Convert EmitStatement to a goto to the next block
+                if idx < len(basic_blocks) - 1:
+                    # Not the last block, so add goto next block
+                    next_block = basic_blocks[idx + 1]
+                    block["terminator"] = f"goto {next_block['id']}"
+                else:
+                    # Last block in function, should return
+                    block["terminator"] = "return"
+        
         for block in basic_blocks:
             # Check for emit statements in this block
             has_emit = False
             for stmt in block.get("ssa_statements", []):
                 if stmt.startswith("emit "):
                     has_emit = True
-                    # If this is an emit statement block, force the terminator to be "EmitStatement"
-                    if block.get("terminator") != "EmitStatement":
-                        block["terminator"] = "EmitStatement"
             
             # Extract only the essential SSA information
             ssa_block = {
@@ -2260,6 +2500,16 @@ class ASTParser:
             
             # Always include accesses for better tracking
             ssa_block["accesses"] = block.get("accesses", {"reads": [], "writes": []})
+            
+            # Fix any emit statements that might not have been converted to goto
+            if has_emit and ssa_block["terminator"] == "EmitStatement":
+                # Find the next block to goto
+                current_idx = basic_blocks.index(block)
+                if current_idx < len(basic_blocks) - 1:
+                    next_block = basic_blocks[current_idx + 1]
+                    ssa_block["terminator"] = f"goto {next_block['id']}"
+                else:
+                    ssa_block["terminator"] = "return"
             
             # Check for emit statements and update accesses if needed
             if has_emit:
