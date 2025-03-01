@@ -87,24 +87,34 @@ def main(path):
                         print(f"  Blocks: {len(basic_blocks)}")
                         print(f"  SSA Blocks: {len(ssa_blocks)}")
                         
-                        # Calculate total reads and writes (with error handling)
+                        # Print detailed SSA block information
                         try:
-                            total_reads = sum(len(block.get("accesses", {}).get("reads", [])) for block in basic_blocks)
-                            total_writes = sum(len(block.get("accesses", {}).get("writes", [])) for block in basic_blocks)
-                            print(f"  Variable Accesses: {total_reads} reads, {total_writes} writes")
-                        except (TypeError, AttributeError) as e:
-                            print(f"  Variable Accesses: Error calculating - {str(e)}")
-                        
-                        # Print a sample of the first block's SSA statements if available
-                        try:
-                            if ssa_blocks and ssa_blocks[0].get("ssa_statements"):
-                                print("  SSA Sample:")
-                                for i, stmt in enumerate(ssa_blocks[0].get("ssa_statements", [])[:2]):
-                                    print(f"    {stmt}")
-                                if len(ssa_blocks[0].get("ssa_statements", [])) > 2:
-                                    print("    ...")
+                            if ssa_blocks:
+                                print("  SSA Blocks:")
+                                for block in ssa_blocks:
+                                    block_id = block.get("id", "Unknown")
+                                    ssa_statements = block.get("ssa_statements", [])
+                                    terminator = block.get("terminator", "Unknown")
+                                    reads = block.get("accesses", {}).get("reads", [])
+                                    writes = block.get("accesses", {}).get("writes", [])
+                                    
+                                    print(f"    Block {block_id}:")
+                                    print(f"      SSA: {ssa_statements}")
+                                    print(f"      Terminator: {terminator}")
+                                    print(f"      Accesses: reads={reads}, writes={writes}")
                         except (TypeError, AttributeError, IndexError) as e:
-                            print(f"  SSA Sample: Error displaying - {str(e)}")
+                            print(f"    Error displaying SSA blocks: {str(e)}")
+                        
+                        # Print detailed variable accesses by block
+                        try:
+                            print("  Variable Accesses:")
+                            for block in ssa_blocks:
+                                block_id = block.get("id", "Unknown")
+                                reads = block.get("accesses", {}).get("reads", [])
+                                writes = block.get("accesses", {}).get("writes", [])
+                                print(f"    Block {block_id}: reads={reads}, writes={writes}")
+                        except (TypeError, AttributeError) as e:
+                            print(f"    Error calculating variable accesses: {str(e)}")
                     except Exception as e:
                         print(f"  Error processing entrypoint: {str(e)}")
                     

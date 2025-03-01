@@ -46,12 +46,12 @@ class TestSSAIntegration(unittest.TestCase):
         self.assertEqual(result[1]["ssa_statements"], ["if (x_1)"])
         self.assertEqual(result[1]["terminator"], "if x_1 > 0 then goto Block2 else goto Block3")
         
-        # Verify that only the required fields are included
-        self.assertEqual(len(result[0].keys()), 3)
+        # Verify that all required fields are included (now including accesses)
+        self.assertEqual(len(result[0].keys()), 4)
         self.assertTrue("id" in result[0])
         self.assertTrue("ssa_statements" in result[0])
         self.assertTrue("terminator" in result[0])
-        self.assertFalse("accesses" in result[0])
+        self.assertTrue("accesses" in result[0])  # We now include accesses in the output
         self.assertFalse("statements" in result[0])
         self.assertFalse("ssa_versions" in result[0])
 

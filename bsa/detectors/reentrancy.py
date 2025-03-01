@@ -55,15 +55,25 @@ class ReentrancyDetector(Detector):
                 # print(f"DEBUG detect: Using raw body")
             
             # Check for reentrancy
-            has_reentrancy = self.check_reentrancy(body, state_vars)
+            reentrancy_result = self.check_reentrancy(body, state_vars)
             
-            if has_reentrancy:
-                self.add_finding({
-                    "contract_name": contract_name,
-                    "function_name": function_name,
-                    "description": "External call detected before state variable write",
-                    "severity": "High"
-                })
+            if reentrancy_result:
+                # If the result is a string, it contains details about the vulnerable statement
+                if isinstance(reentrancy_result, str):
+                    self.add_finding({
+                        "contract_name": contract_name,
+                        "function_name": function_name,
+                        "description": f"External call detected before state variable write ({reentrancy_result})",
+                        "severity": "High"
+                    })
+                else:
+                    # Backward compatibility for when the result is just True
+                    self.add_finding({
+                        "contract_name": contract_name,
+                        "function_name": function_name,
+                        "description": "External call detected before state variable write",
+                        "severity": "High"
+                    })
         
         return self.findings
     
@@ -173,10 +183,12 @@ class ReentrancyDetector(Detector):
                 flat_statements.extend(statement.get("statements", []))
         
         # Process statements in order
-        for statement in flat_statements:
+        for i, statement in enumerate(flat_statements):
             # If we've seen an external call, check if this statement writes to state
             if has_external_call and self.is_state_variable_write(statement, state_vars):
-                return True
+                # For raw AST, we can't provide detailed SSA information
+                # Just report the statement index for reference
+                return f"state write at statement {i}"
                 
             # Check for external calls
             if self.is_external_call(statement):
@@ -236,6 +248,23 @@ class ReentrancyDetector(Detector):
         for call_block_idx in call_blocks:
             for write_block_idx in state_write_blocks:
                 if write_block_idx > call_block_idx:
-                    return True
+                    # Get the vulnerable statement details
+                    write_block = basic_blocks[write_block_idx]
+                    write_block_id = write_block.get("id", "Unknown")
+                    
+                    # Find the statement that writes to a state variable
+                    vuln_statement = None
+                    for stmt in write_block.get("ssa_statements", []):
+                        for state_var in state_vars:
+                            var_name = state_var["name"]
+                            if f"{var_name}_" in stmt and " = " in stmt:
+                                vuln_statement = stmt
+                                break
+                        if vuln_statement:
+                            break
+                    
+                    # Return details about the vulnerable state write
+                    write_details = f"{vuln_statement} at {write_block_id}" if vuln_statement else f"state write at {write_block_id}"
+                    return write_details
         
         return False
