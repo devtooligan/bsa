@@ -42,10 +42,10 @@ libs = ["lib"]
     
     def test_if_statement_ssa(self):
         """Test SSA generation for a simple if statement."""
-        # Check if forge is installed
+        # Check if forge is installed - this should always be true in a proper dev environment
         import shutil
         if shutil.which("forge") is None:
-            self.skipTest("forge not installed, skipping test")
+            self.fail("Forge not found! It should be installed for these tests to run.")
         # Create the test contract
         self.create_solidity_file("SimpleIf.sol", """
 // SPDX-License-Identifier: MIT
@@ -99,10 +99,10 @@ contract SimpleIf {
     
     def test_for_loop_ssa(self):
         """Test SSA generation for a for loop."""
-        # Check if forge is installed
+        # Check if forge is installed - this should always be true in a proper dev environment
         import shutil
         if shutil.which("forge") is None:
-            self.skipTest("forge not installed, skipping test")
+            self.fail("Forge not found! It should be installed for these tests to run.")
         # Create the test contract
         self.create_solidity_file("ForLoop.sol", """
 // SPDX-License-Identifier: MIT
@@ -155,10 +155,10 @@ contract ForLoop {
     
     def test_external_call_ssa(self):
         """Test SSA generation with an external call."""
-        # Check if forge is installed
+        # Check if forge is installed - this should always be true in a proper dev environment
         import shutil
         if shutil.which("forge") is None:
-            self.skipTest("forge not installed, skipping test")
+            self.fail("Forge not found! It should be installed for these tests to run.")
         # Create the test contract
         self.create_solidity_file("ExternalCall.sol", """
 // SPDX-License-Identifier: MIT
@@ -210,10 +210,10 @@ contract ExternalCall {
     
     def test_return_ssa(self):
         """Test SSA generation with a return statement."""
-        # Check if forge is installed
+        # Check if forge is installed - this should always be true in a proper dev environment
         import shutil
         if shutil.which("forge") is None:
-            self.skipTest("forge not installed, skipping test")
+            self.fail("Forge not found! It should be installed for these tests to run.")
         # Create the test contract
         self.create_solidity_file("Return.sol", """
 // SPDX-License-Identifier: MIT
